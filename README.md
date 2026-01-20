@@ -42,14 +42,11 @@ python tuxonthebeach.py
 ## Usage
 
 ### 1. Import Route
-- Visit [exile-leveling](https://heartofphos.github.io/exile-leveling/)
-- Select your build/route
-- Open Browser DevTools (F12) → Console
-- Paste and run:
-```javascript
-  copy(localStorage.getItem('route'))
-```
-- Click **📋** button in TuxontheBeach overlay
+- Open the [exile-leveling](https://heartofphos.github.io/exile-leveling/) Website
+- Select your build/route.
+- Click the menu with three lines (top right).
+- Choose "3rd Party Export" to copy the code to clipboard.
+- Paste the code into TuxontheBeach overlay via 📋 button.
 
 ### 2. Play & Track
 - Start Path of Exile
