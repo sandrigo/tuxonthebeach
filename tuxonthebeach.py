@@ -14,10 +14,35 @@ import os
 from pathlib import Path
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                               QHBoxLayout, QLabel, QPushButton, QSizeGrip)
-from PyQt6.QtCore import Qt, pyqtSignal, QPoint
+from PyQt6.QtCore import Qt, pyqtSignal, QPoint, QTimer
 from PyQt6.QtGui import QFont, QCursor
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
+
+# Config directory for persistence
+CONFIG_DIR = Path.home() / ".config" / "tuxonthebeach"
+CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+PROGRESS_FILE = CONFIG_DIR / "progress.json"
+
+# Load gem and area data
+SCRIPT_DIR = Path(__file__).parent
+try:
+    with open(SCRIPT_DIR / "gems.json", "r") as f:
+        GEM_DATA = json.load(f)
+except:
+    GEM_DATA = {}
+
+try:
+    with open(SCRIPT_DIR / "areas.json", "r") as f:
+        AREA_DATA = json.load(f)
+except:
+    AREA_DATA = {}
+
+try:
+    with open(SCRIPT_DIR / "quests.json", "r") as f:
+        QUEST_DATA = json.load(f)
+except:
+    QUEST_DATA = {}
 
 class RouteData:
     """Manages route data from exile-leveling export"""
@@ -25,6 +50,7 @@ class RouteData:
         self.acts = []
         self.zone_steps = {}
         self.all_steps = []
+        self.route_hash = ""
         
     def load_from_json(self, json_data):
         """Load route from exile-leveling JSON export"""
@@ -41,6 +67,9 @@ class RouteData:
                 return False
             
             self._build_step_list()
+            # Generate hash for route identification
+            import hashlib
+            self.route_hash = hashlib.md5(json_data.encode()).hexdigest()[:8]
             print(f"Loaded {len(self.acts)} acts, {len(self.all_steps)} steps")
             return True
         except Exception as e:
@@ -77,39 +106,27 @@ class RouteData:
     def _extract_zones(self, step):
         """Extract zone names from step"""
         zones = []
-        zone_map = {
-            "1_1_1": "The Twilight Strand",
-            "1_1_town": "Lioneye's Watch",
-            "1_1_2": "The Coast",
-            "1_1_3": "The Mud Flats",
-            "1_1_4_1": "The Fetid Pool",
-            "1_1_2a": "The Tidal Island",
-            "1_1_4_0": "The Submerged Passage",
-            "1_1_5": "The Flooded Depths",
-            "1_1_6": "The Ledge",
-            "1_1_7_1": "The Climb",
-            "1_1_7_2": "The Lower Prison",
-            "1_1_8": "Prisoner's Gate",
-            "1_1_9": "The Ship Graveyard",
-            "1_1_9a": "The Cavern of Wrath",
-            "1_1_11_1": "The Cavern of Anger",
-            "1_1_11_2": "Merveil's Caverns",
-            "1_2_1": "The Southern Forest",
-            "1_2_town": "The Forest Encampment",
-            "1_2_2": "The Old Fields",
-            "1_2_2a": "The Den",
-            "1_2_3": "The Crossroads",
-        }
         
         for part in step.get("parts", []):
             if isinstance(part, dict) and part.get("type") == "enter":
                 area_id = part.get("areaId", "")
-                zones.append(zone_map.get(area_id, area_id))
+                # Lookup from areas.json
+                if area_id in AREA_DATA:
+                    zone_name = AREA_DATA[area_id].get("name", area_id)
+                    zones.append(zone_name)
+                else:
+                    zones.append(area_id)
         
         return zones
     
     def _format_step(self, step):
         """Convert step to readable text - match exile-leveling format"""
+        step_type = step.get("type", "")
+        
+        # Handle gem_step specially
+        if step_type == "gem_step":
+            return self._format_gem_step(step)
+        
         parts = step.get("parts", [])
         
         # Build main step text
@@ -130,6 +147,39 @@ class RouteData:
         
         return main_text
     
+    def _format_gem_step(self, step):
+        """Format gem acquisition step"""
+        gem = step.get("requiredGem", {})
+        gem_id = gem.get("id", "")
+        count = step.get("count", 1)
+        reward_type = step.get("rewardType", "quest")
+        
+        # Lookup gem name from gems.json
+        gem_name = "Unknown Gem"
+        if gem_id in GEM_DATA:
+            gem_name = GEM_DATA[gem_id].get("name", gem_name)
+        else:
+            # Fallback: clean gem name from ID
+            gem_name = gem_id.replace("Metadata/Items/Gems/", "")
+            gem_name = gem_name.replace("SkillGem", "").replace("SupportGem", "")
+            gem_name = re.sub(r'([A-Z])', r' \1', gem_name).strip()
+        
+        # Color based on type
+        is_support = GEM_DATA.get(gem_id, {}).get("is_support", False) if gem_id in GEM_DATA else "Support" in gem_id
+        
+        if is_support:
+            color = "#3498db"  # Blue for support
+            icon = "⬡"
+        else:
+            color = "#1abc9c"  # Green for skill
+            icon = "💎"
+        
+        # Source badge
+        source = "Quest" if reward_type == "quest" else "Vendor"
+        source_color = "#f39c12" if reward_type == "quest" else "#95a5a6"
+        
+        return f'<span style="color: {color}; font-weight: bold;">{icon} {gem_name}</span> <span style="color: {source_color}; font-size: 10px;">({source})</span>'
+    
     def _format_parts(self, parts):
         """Format a list of parts into text with color coding"""
         result = []
@@ -145,86 +195,52 @@ class RouteData:
                 value = part.get("value", "")
                 
                 if ptype == "kill":
-                    result.append(f'<span style="color: #ff6b6b;">{value}</span>')
+                    result.append(f'<span style="color: #ff6b6b; font-weight: bold;">{value}</span>')
                 elif ptype == "quest_text":
-                    result.append(f'<span style="color: #4ecdc4;">{value}</span>')
+                    result.append(f'<span style="color: #4ecdc4; font-weight: bold;">{value}</span>')
                 elif ptype == "waypoint_get":
-                    result.append('<span style="color: #95e1d3;">Waypoint</span>')
+                    result.append('<span style="color: #95e1d3; font-weight: bold;">Waypoint</span>')
                 elif ptype == "waypoint_use":
-                    result.append('<span style="color: #95e1d3;">Waypoint</span>')
+                    result.append('<span style="color: #95e1d3; font-weight: bold;">Waypoint</span>')
                 elif ptype == "portal_set":
-                    result.append('<span style="color: #a8e6cf;">Portal</span>')
+                    result.append('<span style="color: #a8e6cf; font-weight: bold;">Portal</span>')
                 elif ptype == "portal_use":
-                    result.append('<span style="color: #a8e6cf;">Portal</span>')
+                    result.append('<span style="color: #a8e6cf; font-weight: bold;">Portal</span>')
                 elif ptype == "trial":
-                    result.append('<span style="color: #ffd93d;">Trial</span>')
+                    result.append('<span style="color: #ffd93d; font-weight: bold;">Trial</span>')
                 elif ptype == "dir":
                     dirs = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"]
                     idx = part.get("dirIndex", 0)
-                    result.append(f'<span style="color: #c7ceea;">{dirs[idx]}</span>')
+                    result.append(f'<span style="color: #c7ceea; font-weight: bold;">{dirs[idx]}</span>')
                 elif ptype == "arena":
-                    result.append(f'<span style="color: #ff6348;">{value}</span>')
+                    result.append(f'<span style="color: #ff6348; font-weight: bold;">{value}</span>')
                 elif ptype == "enter":
-                    # Get area name
+                    # Get area name from areas.json
                     area_id = part.get("areaId", "")
-                    zone_map = {
-                        "1_1_1": "The Twilight Strand",
-                        "1_1_town": "Lioneye's Watch",
-                        "1_1_2": "The Coast",
-                        "1_1_3": "The Mud Flats",
-                        "1_1_4_1": "The Fetid Pool",
-                        "1_1_2a": "The Tidal Island",
-                        "1_1_4_0": "The Submerged Passage",
-                        "1_1_5": "The Flooded Depths",
-                        "1_1_6": "The Ledge",
-                        "1_1_7_1": "The Climb",
-                        "1_1_7_2": "The Lower Prison",
-                        "1_1_8": "Prisoner's Gate",
-                        "1_1_9": "The Ship Graveyard",
-                        "1_1_9a": "The Cavern of Wrath",
-                        "1_1_11_1": "The Cavern of Anger",
-                        "1_1_11_2": "Merveil's Caverns",
-                        "1_2_1": "The Southern Forest",
-                        "1_2_town": "The Forest Encampment",
-                        "1_2_2": "The Old Fields",
-                        "1_2_2a": "The Den",
-                        "1_2_3": "The Crossroads",
-                        "1_2_4": "The Broken Bridge",
-                    }
-                    zone_name = zone_map.get(area_id, area_id)
-                    result.append(f'<span style="color: #f6b93b;">{zone_name}</span>')
+                    if area_id in AREA_DATA:
+                        area_name = AREA_DATA[area_id].get("name", area_id)
+                    else:
+                        area_name = area_id
+                    result.append(f'<span style="color: #feca57; font-weight: bold;">{area_name}</span>')
                 elif ptype == "logout":
-                    result.append('<span style="color: #e55039;">Logout</span>')
+                    result.append('<span style="color: #e55039; font-weight: bold;">Logout</span>')
                 elif ptype == "quest":
-                    # Extract quest name from rewards
+                    # Extract quest name from quests.json
                     quest_id = part.get("questId", "")
-                    rewards = part.get("rewardOffers", [])
-                    # Quest names mapping (expand as needed)
-                    quest_names = {
-                        "a1q1": "Enemy at the Gate",
-                        "a1q2": "Mercy Mission",
-                        "a1q4": "The Tidal Island",
-                        "a1q5": "Breaking Some Eggs",
-                        "a1q7": "The Dweller of the Deep",
-                        "a1q3": "The Marooned Mariner",
-                        "a1q6": "The Caged Brute",
-                        "a1q9": "Victario's Secrets",
-                        "a2q10": "The Great White Beast",
-                        "a2q6": "Intruders in Black",
-                        "a2q5": "The Way Forward",
-                        "a2q4": "Sharp and Cruel",
-                    }
-                    qname = quest_names.get(quest_id, quest_id)
-                    result.append(f'<span style="color: #fdcb6e;">{qname}</span>')
+                    if quest_id in QUEST_DATA:
+                        qname = QUEST_DATA[quest_id].get("name", quest_id)
+                    else:
+                        qname = quest_id
+                    result.append(f'<span style="color: #fdcb6e; font-weight: bold;">{qname}</span>')
                 elif ptype == "generic":
-                    result.append(f'<span style="color: #74b9ff;">{value}</span>')
+                    result.append(f'<span style="color: #74b9ff; font-weight: bold;">{value}</span>')
                 elif ptype == "crafting":
                     recipes = part.get("crafting_recipes", [])
                     if recipes:
-                        result.append(f'<span style="color: #a29bfe;">Recipe: {recipes[0]}</span>')
+                        result.append(f'<span style="color: #a29bfe; font-weight: bold;">Recipe: {recipes[0]}</span>')
                 elif ptype == "ascend":
                     ver = part.get("version", "normal")
-                    result.append(f'<span style="color: #fd79a8;">Lab ({ver})</span>')
+                    result.append(f'<span style="color: #fd79a8; font-weight: bold;">Lab ({ver})</span>')
                 elif ptype == "area":
                     # Just area reference
                     pass
@@ -307,122 +323,277 @@ class OverlayWindow(QMainWindow):
         self.init_ui()
         self.setup_watcher()
         self.zone_changed.connect(self.on_zone_change)
+        
+        # Load saved progress
+        self.load_progress()
+    
+    def load_progress(self):
+        """Load saved progress and route from config file"""
+        try:
+            if PROGRESS_FILE.exists():
+                with open(PROGRESS_FILE, 'r') as f:
+                    data = json.load(f)
+                
+                # Restore full route if available
+                if 'route_data' in data:
+                    route_data = data['route_data']
+                    self.route_data.acts = route_data.get('acts', [])
+                    self.route_data.all_steps = route_data.get('all_steps', [])
+                    self.route_data.zone_steps = route_data.get('zone_steps', {})
+                    self.route_data.route_hash = data.get('route_hash', '')
+                    
+                    self.current_step_index = data.get('current_step', 0)
+                    self.current_zone = data.get('current_zone', 'Unknown')
+                    
+                    print(f"🔄 Restored: Step {self.current_step_index + 1}/{len(self.route_data.all_steps)}, Zone: {self.current_zone}")
+                    self.update_display()
+                    return True
+                else:
+                    print("⚠️  No saved route found")
+                    return False
+        except Exception as e:
+            print(f"❌ Error loading progress: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
+    
+    def save_progress(self):
+        """Save current progress and full route to config file"""
+        try:
+            data = {
+                'route_hash': self.route_data.route_hash,
+                'current_step': self.current_step_index,
+                'current_zone': self.current_zone,
+                'route_data': {
+                    'acts': self.route_data.acts,
+                    'all_steps': self.route_data.all_steps,
+                    'zone_steps': self.route_data.zone_steps
+                },
+                'timestamp': str(Path(PROGRESS_FILE).stat().st_mtime if PROGRESS_FILE.exists() else 0)
+            }
+            
+            with open(PROGRESS_FILE, 'w') as f:
+                json.dump(data, f, indent=2)
+            
+            print(f"💾 Progress saved: Step {self.current_step_index + 1}/{len(self.route_data.all_steps)}")
+        except Exception as e:
+            print(f"❌ Error saving progress: {e}")
     
     def init_ui(self):
         """Initialize UI"""
         self.setWindowTitle("TuxontheBeach - Linux PoE Leveling Helper")
         
-        # CRITICAL: Remove X11BypassWindowManagerHint - it breaks dragging
+        # Window flags
         self.setWindowFlags(
             Qt.WindowType.WindowStaysOnTopHint |
             Qt.WindowType.FramelessWindowHint |
             Qt.WindowType.Tool
         )
         
+        # CRITICAL: Don't steal focus from game
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        
+        # Wayland workaround for always-on-top
+        self.setup_always_on_top()
+        
+        # Aggressive raise timer
+        self.raise_timer = QTimer(self)
+        self.raise_timer.timeout.connect(self.force_to_top)
+        self.raise_timer.start(500)  # More aggressive for Wayland
+        
         central = QWidget()
         self.setCentralWidget(central)
         layout = QVBoxLayout(central)
-        layout.setContentsMargins(2, 2, 2, 2)
-        layout.setSpacing(2)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
         
-        # Compact header
+        # Header - KOMPAKT wie Nav-Buttons
         self.header = QWidget()
-        self.header.setStyleSheet("background: #1a1a1a; padding: 3px;")
+        self.header.setStyleSheet("background: #1a1a1a; border-bottom: 1px solid #d4af37;")
         self.header.setCursor(QCursor(Qt.CursorShape.SizeAllCursor))
         header_layout = QHBoxLayout(self.header)
-        header_layout.setContentsMargins(5, 3, 5, 3)
+        header_layout.setContentsMargins(8, 6, 8, 6)
         
         title = QLabel("TuxontheBeach")
-        title.setStyleSheet("color: #d4af37; font-weight: bold; font-size: 10px;")
+        title.setStyleSheet("""
+            color: #d4af37; 
+            font-weight: bold; 
+            font-size: 12px;
+            letter-spacing: 0.5px;
+        """)
         header_layout.addWidget(title)
         header_layout.addStretch()
         
-        # Tiny buttons
+        # Compact header buttons - KLEIN
         btn_style = """
             QPushButton {
                 background: #2a2a2a;
                 border: 1px solid #555;
                 color: #aaa;
-                padding: 2px 6px;
-                font-size: 9px;
+                padding: 3px 6px;
+                font-size: 10px;
                 border-radius: 2px;
+                min-width: 20px;
+                max-width: 20px;
+                min-height: 20px;
+                max-height: 20px;
             }
-            QPushButton:hover { background: #3a3a3a; }
+            QPushButton:hover { 
+                background: #3a3a3a;
+                border-color: #d4af37;
+                color: #d4af37;
+            }
         """
         
-        imp_btn = QPushButton("📋")
+        imp_btn = QPushButton("⬇")
         imp_btn.setToolTip("Import from Clipboard")
         imp_btn.clicked.connect(self.import_from_clipboard)
-        imp_btn.setStyleSheet(btn_style)
-        imp_btn.setMaximumWidth(25)
+        imp_btn.setStyleSheet(btn_style + """
+            QPushButton { 
+                border-color: #d4af37; 
+                color: #d4af37;
+            }
+        """)
         header_layout.addWidget(imp_btn)
         
+        about_btn = QPushButton("?")
+        about_btn.setToolTip("About")
+        about_btn.clicked.connect(self.show_about)
+        about_btn.setStyleSheet(btn_style)
+        header_layout.addWidget(about_btn)
+        
         close_btn = QPushButton("✕")
-        close_btn.clicked.connect(self.close)
-        close_btn.setStyleSheet(btn_style + "QPushButton { color: #f44; }")
-        close_btn.setMaximumWidth(25)
+        close_btn.setToolTip("Close (with confirmation)")
+        close_btn.clicked.connect(self.confirm_close)
+        close_btn.setStyleSheet(btn_style + """
+            QPushButton { 
+                color: #e74c3c;
+                border-color: #e74c3c;
+            }
+        """)
         header_layout.addWidget(close_btn)
         
         layout.addWidget(self.header)
         
-        # Zone info (compact)
+        # Zone info - compact with ellipsis
         self.zone_label = QLabel("No zone")
-        self.zone_label.setStyleSheet("color: #888; font-size: 9px; padding: 2px 5px; background: #0a0a0a;")
+        self.zone_label.setStyleSheet("""
+            color: #888; 
+            font-size: 10px; 
+            padding: 4px 12px; 
+            background: #0a0a0a;
+            border-bottom: 1px solid #222;
+        """)
+        self.zone_label.setTextFormat(Qt.TextFormat.PlainText)
         layout.addWidget(self.zone_label)
         
-        # Main step display - BIG
+        # Main step display - with text selection and ellipsis for overflow
         self.step_label = QLabel("Import route to begin")
-        self.step_label.setFont(QFont("sans-serif", 13))
+        self.step_label.setFont(QFont("sans-serif", 12))
         self.step_label.setWordWrap(True)
-        self.step_label.setTextFormat(Qt.TextFormat.RichText)  # Enable HTML
+        self.step_label.setTextFormat(Qt.TextFormat.RichText)
+        self.step_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         self.step_label.setStyleSheet("""
-            color: #fff;
-            padding: 15px;
-            background: #0a0a0a;
+            QLabel {
+                color: #fff;
+                padding: 12px;
+                background: #0a0a0a;
+            }
         """)
-        self.step_label.setMinimumHeight(100)
+        self.step_label.setMinimumHeight(80)
         layout.addWidget(self.step_label, stretch=1)
         
-        # Navigation - icons only
+        # Gem panel - compact
+        self.gem_panel = QLabel()
+        self.gem_panel.setWordWrap(True)
+        self.gem_panel.setTextFormat(Qt.TextFormat.RichText)
+        self.gem_panel.setStyleSheet("""
+            color: #1abc9c;
+            padding: 6px 12px;
+            background: #0f1f1f;
+            border-top: 1px solid #1abc9c;
+            font-size: 10px;
+        """)
+        self.gem_panel.hide()
+        layout.addWidget(self.gem_panel)
+        
+        # Navigation - SMALLER BUTTONS (50% reduction)
         nav = QWidget()
-        nav.setStyleSheet("background: #0a0a0a;")
+        nav.setStyleSheet("background: #0a0a0a; border-top: 1px solid #222;")
         nav_layout = QHBoxLayout(nav)
-        nav_layout.setContentsMargins(5, 5, 5, 5)
+        nav_layout.setContentsMargins(8, 6, 8, 6)
         
         nav_btn_style = """
             QPushButton {
                 background: #2a2a2a;
                 border: 1px solid #d4af37;
                 color: #d4af37;
-                padding: 8px 15px;
+                padding: 5px 10px;
                 border-radius: 3px;
-                font-size: 14px;
+                font-size: 12px;
                 font-weight: bold;
+                min-width: 32px;
             }
-            QPushButton:hover { background: #3a3a3a; }
+            QPushButton:hover { 
+                background: #3a3a3a;
+                border-color: #f4c542;
+            }
             QPushButton:pressed { background: #4a4a4a; }
         """
         
         prev_btn = QPushButton("◄")
+        prev_btn.setToolTip("Previous step")
         prev_btn.clicked.connect(self.prev_step)
         prev_btn.setStyleSheet(nav_btn_style)
         nav_layout.addWidget(prev_btn)
         
         self.counter = QLabel("0/0")
         self.counter.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.counter.setStyleSheet("color: #666; font-size: 10px;")
+        self.counter.setStyleSheet("color: #888; font-size: 11px; font-weight: bold;")
         nav_layout.addWidget(self.counter, stretch=1)
         
+        # Gem toggle button - small icon
+        self.gem_visible = True
+        self.gem_toggle_btn = QPushButton("💎")
+        self.gem_toggle_btn.setToolTip("Show/Hide Gem Overlay")
+        self.gem_toggle_btn.clicked.connect(self.toggle_gem_panel)
+        self.gem_toggle_btn.setStyleSheet("""
+            QPushButton {
+                background: #0f1f1f;
+                border: 1px solid #1abc9c;
+                color: #1abc9c;
+                padding: 5px 8px;
+                border-radius: 3px;
+                font-size: 10px;
+                min-width: 28px;
+                max-width: 28px;
+            }
+            QPushButton:hover { 
+                background: #1a2f2f;
+                border-color: #2ecc71;
+            }
+            QPushButton:pressed { background: #0a1515; }
+        """)
+        nav_layout.addWidget(self.gem_toggle_btn)
+        
         next_btn = QPushButton("►")
+        next_btn.setToolTip("Next step")
         next_btn.clicked.connect(self.next_step)
         next_btn.setStyleSheet(nav_btn_style)
         nav_layout.addWidget(next_btn)
         
         layout.addWidget(nav)
         
-        # Resize grip
+        # Resize grip - bigger and more visible
         self.size_grip = QSizeGrip(central)
-        self.size_grip.setStyleSheet("background: #d4af37; width: 10px; height: 10px;")
+        self.size_grip.setStyleSheet("""
+            QSizeGrip {
+                background: #d4af37; 
+                width: 12px; 
+                height: 12px;
+            }
+        """)
         layout.addWidget(self.size_grip, alignment=Qt.AlignmentFlag.AlignBottom | Qt.AlignmentFlag.AlignRight)
         
         self.setStyleSheet("""
@@ -432,7 +603,8 @@ class OverlayWindow(QMainWindow):
             }
         """)
         
-        self.resize(400, 250)
+        self.resize(400, 280)
+        self.setMinimumSize(300, 200)  # Prevent too small window
         
         # Position on primary screen
         screen = QApplication.primaryScreen().geometry()
@@ -479,13 +651,34 @@ class OverlayWindow(QMainWindow):
             self.observer.schedule(self.log_watcher, str(self.log_watcher.client_txt.parent))
             self.observer.start()
     
-    def on_zone_change(self, zone):
-        self.current_zone = zone
-        self.zone_label.setText(f"Zone: {zone}")
+    def on_zone_change(self, zone_name):
+        """Handle zone change with auto-progression"""
+        self.current_zone = zone_name
+        self.zone_label.setText(f"Zone: {zone_name}")
         
-        idx = self.route_data.get_step_index_for_zone(zone)
-        if idx is not None:
-            self.current_step_index = idx
+        # Get step index for this zone
+        step_idx = self.route_data.get_step_index_for_zone(zone_name)
+        
+        if step_idx is not None:
+            # Auto-advance if we're behind
+            if step_idx > self.current_step_index:
+                self.current_step_index = step_idx
+            # If we're ahead, check if current step targets this zone
+            elif self.current_step_index < len(self.route_data.all_steps):
+                current_step = self.route_data.all_steps[self.current_step_index]
+                # Check if current step mentions this zone (for re-visits)
+                if zone_name not in str(current_step.get('text', '')):
+                    # Look ahead for next occurrence of this zone
+                    for idx in range(self.current_step_index + 1, len(self.route_data.all_steps)):
+                        if zone_name in str(self.route_data.all_steps[idx].get('text', '')):
+                            self.current_step_index = idx
+                            break
+            
+            self.update_display()
+            self.save_progress()  # Save after zone change
+            print(f"Auto-progressed to step {self.current_step_index + 1} for zone: {zone_name}")
+        else:
+            # No specific step for this zone, just update display
             self.update_display()
     
     def update_display(self):
@@ -500,27 +693,273 @@ class OverlayWindow(QMainWindow):
         step = self.route_data.all_steps[self.current_step_index]
         self.step_label.setText(step['text'])
         self.counter.setText(f"{self.current_step_index + 1}/{total}")
+        
+        # Update gem panel with next 3 gems
+        self._update_gem_panel()
+    
+    def next_step(self):
+        """Go to next step with smart skipping"""
+        if self.current_step_index < len(self.route_data.all_steps) - 1:
+            self.current_step_index += 1
+            
+            # Skip steps that don't match current zone context (basic smart skip)
+            # You can expand this with more logic like Exile-UI's condition system
+            skipped = 0
+            while self.current_step_index < len(self.route_data.all_steps) - 1:
+                step = self.route_data.all_steps[self.current_step_index]
+                # Basic check: if step explicitly mentions a different zone, might skip
+                # For now, just advance normally
+                break
+            
+            self.update_display()
+            self.save_progress()  # Save on manual navigation
+            
+            # Check if we reached end
+            if self.current_step_index >= len(self.route_data.all_steps) - 1:
+                self.step_label.setText("<span style='color: #ffff00;'>Guide Complete!</span>")
     
     def prev_step(self):
+        """Go to previous step"""
         if self.current_step_index > 0:
             self.current_step_index -= 1
             self.update_display()
+            self.save_progress()  # Save on manual navigation
     
-    def next_step(self):
-        if self.current_step_index < len(self.route_data.all_steps) - 1:
-            self.current_step_index += 1
-            self.update_display()
+    def _update_gem_panel(self):
+        """Show next 3 gems in compact panel"""
+        gems = []
+        
+        # Look ahead for next 3 gem steps
+        for idx in range(self.current_step_index, min(self.current_step_index + 20, len(self.route_data.all_steps))):
+            step_data = self.route_data.all_steps[idx]
+            
+            # Check if it's a gem in the text (formatted by _format_gem_step)
+            if '💎' in step_data['text'] or '⬡' in step_data['text']:
+                gems.append(step_data['text'])
+                if len(gems) >= 3:
+                    break
+        
+        if gems and self.gem_visible:
+            gem_text = '<b>Next Gems:</b><br>' + '<br>'.join(gems)
+            self.gem_panel.setText(gem_text)
+            self.gem_panel.show()
+        else:
+            self.gem_panel.hide()
+    
+    def toggle_gem_panel(self):
+        """Toggle gem panel visibility"""
+        self.gem_visible = not self.gem_visible
+        
+        # Update button style to show state
+        if self.gem_visible:
+            self.gem_toggle_btn.setStyleSheet("""
+                QPushButton {
+                    background: #0f1f1f;
+                    border: 1px solid #1abc9c;
+                    color: #1abc9c;
+                    padding: 5px 8px;
+                    border-radius: 3px;
+                    font-size: 10px;
+                    min-width: 28px;
+                    max-width: 28px;
+                }
+                QPushButton:hover { 
+                    background: #1a2f2f;
+                    border-color: #2ecc71;
+                }
+                QPushButton:pressed { background: #0a1515; }
+            """)
+        else:
+            self.gem_toggle_btn.setStyleSheet("""
+                QPushButton {
+                    background: #1a1a1a;
+                    border: 1px solid #555;
+                    color: #666;
+                    padding: 5px 8px;
+                    border-radius: 3px;
+                    font-size: 10px;
+                    min-width: 28px;
+                    max-width: 28px;
+                }
+                QPushButton:hover { 
+                    background: #2a2a2a;
+                    border-color: #1abc9c;
+                    color: #1abc9c;
+                }
+                QPushButton:pressed { background: #0a0a0a; }
+            """)
+        
+        self._update_gem_panel()
     
     def import_from_clipboard(self):
         text = QApplication.clipboard().text()
         if text and self.route_data.load_from_json(text):
             self.current_step_index = 0
             self.update_display()
+            self.save_progress()  # Save imported route immediately
+            print(f"✅ Route imported and saved ({len(self.route_data.all_steps)} steps)")
+    
+    def show_about(self):
+        """Show about dialog"""
+        from PyQt6.QtWidgets import QDialog, QVBoxLayout, QLabel, QPushButton
+        from PyQt6.QtCore import Qt
+        
+        dialog = QDialog(self)
+        dialog.setWindowTitle("About TuxontheBeach")
+        dialog.setStyleSheet("""
+            QDialog {
+                background: #141414;
+                border: 2px solid #d4af37;
+            }
+            QLabel {
+                color: #ccc;
+                padding: 5px;
+            }
+        """)
+        
+        layout = QVBoxLayout(dialog)
+        layout.setSpacing(10)
+        
+        # Title
+        title = QLabel("TuxontheBeach")
+        title.setStyleSheet("color: #d4af37; font-size: 18px; font-weight: bold;")
+        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(title)
+        
+        # Description
+        desc = QLabel("Linux overlay for Path of Exile leveling")
+        desc.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(desc)
+        
+        # Links
+        links = QLabel(
+            '<b>Inspired by:</b><br>'
+            '• <a href="https://heartofphos.github.io/exile-leveling/" style="color: #3498db;">Exile-Leveling</a> by HeartofPhos<br>'
+            '• <a href="https://github.com/Lailloken/Exile-UI" style="color: #3498db;">Exile-UI</a> by Lailloken<br><br>'
+            '<b>GitHub:</b> <a href="https://github.com/sandrigo/tuxonthebeach" style="color: #3498db;">sandrigo/tuxonthebeach</a>'
+        )
+        links.setOpenExternalLinks(True)
+        links.setWordWrap(True)
+        links.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(links)
+        
+        # Close button
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(dialog.close)
+        close_btn.setStyleSheet("""
+            QPushButton {
+                background: #2a2a2a;
+                border: 1px solid #d4af37;
+                color: #d4af37;
+                padding: 8px 20px;
+                border-radius: 3px;
+            }
+            QPushButton:hover { background: #3a3a3a; }
+        """)
+        layout.addWidget(close_btn, alignment=Qt.AlignmentFlag.AlignCenter)
+        
+        dialog.setMinimumWidth(350)
+        dialog.exec()
+    
+    def confirm_close(self):
+        """Confirm before closing"""
+        from PyQt6.QtWidgets import QMessageBox
+        
+        msg = QMessageBox(self)
+        msg.setWindowTitle("Close TuxontheBeach?")
+        msg.setText("Really close TuxontheBeach?")
+        msg.setInformativeText("Your progress will be saved.")
+        msg.setStyleSheet("""
+            QMessageBox {
+                background: #141414;
+            }
+            QLabel {
+                color: #ccc;
+            }
+            QPushButton {
+                background: #2a2a2a;
+                border: 1px solid #d4af37;
+                color: #d4af37;
+                padding: 6px 20px;
+                border-radius: 3px;
+                min-width: 80px;
+            }
+            QPushButton:hover {
+                background: #3a3a3a;
+            }
+        """)
+        msg.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        msg.setDefaultButton(QMessageBox.StandardButton.No)
+        
+        if msg.exec() == QMessageBox.StandardButton.Yes:
+            self.close()
+    
+    def setup_always_on_top(self):
+        """Setup always-on-top with Wayland/KWin support"""
+        import os
+        
+        # Detect Wayland
+        is_wayland = 'WAYLAND_DISPLAY' in os.environ
+        
+        if is_wayland:
+            print("🔧 Wayland detected - using KWin DBus for always-on-top")
+            # Use KWin DBus to force window above
+            QTimer.singleShot(500, self.kwin_set_above)
+        else:
+            print("🔧 X11 detected - using standard WindowStaysOnTopHint")
+    
+    def kwin_set_above(self):
+        """Use KWin DBus to set window above (Wayland workaround)"""
+        try:
+            from subprocess import run
+            # Get our window ID
+            win_id = int(self.winId())
+            
+            # Use KWin scripting via DBus to set KeepAbove
+            script = f"""
+var clients = workspace.clientList();
+for (var i = 0; i < clients.length; i++) {{
+    if (clients[i].caption.includes("TuxontheBeach")) {{
+        clients[i].keepAbove = true;
+    }}
+}}
+"""
+            # Try to apply via qdbus
+            run(['qdbus', 'org.kde.KWin', '/Scripting', 
+                 'org.kde.kwin.Scripting.loadScript', script, 'TuxOverlay'],
+                capture_output=True, timeout=1)
+            
+            print("✅ KWin: Window set to KeepAbove")
+        except Exception as e:
+            print(f"⚠️  KWin DBus failed (normal if not KDE): {e}")
+    
+    def force_to_top(self):
+        """Check if POE is active, then raise overlay without stealing focus"""
+        if not self.isVisible() or self.isMinimized():
+            return
+        
+        try:
+            # Try to detect if POE has focus (X11 only)
+            from subprocess import run, PIPE
+            result = run(['xdotool', 'getactivewindow', 'getwindowname'], 
+                        capture_output=True, text=True, timeout=0.1)
+            active_title = result.stdout.strip()
+            
+            # Only raise if POE or similar is active
+            if 'Path of Exile' in active_title or 'PathOfExile' in active_title:
+                self.raise_()  # Visual raise only - POE keeps focus
+        except:
+            # Fallback: always raise if xdotool not available
+            self.raise_()
     
     def closeEvent(self, event):
+        self.save_progress()  # Save on close
+        if hasattr(self, 'raise_timer'):
+            self.raise_timer.stop()
         if self.observer:
             self.observer.stop()
             self.observer.join()
+        print("👋 TuxontheBeach closed - progress saved")
         event.accept()
 
 

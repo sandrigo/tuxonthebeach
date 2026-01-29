@@ -1,97 +1,66 @@
-# TuxontheBeach 🐧
+# TuxontheBeach
 
-A lightweight, Linux-native leveling helper for Path of Exile inspired by [Exile-UI](https://github.com/Lailloken/Exile-UI).
-
-## Why?
-
-Exile-UI is an excellent tool but only runs on Windows due to AutoHotkey dependencies. **TuxontheBeach** brings similar functionality to Linux using Python and Qt6 - simple, native, and lightweight.
-
-## Features
-
-- 🎯 **Auto zone tracking** - Monitors Client.txt for zone changes
-- 📋 **Route import** - Uses [exile-leveling](https://heartofphos.github.io/exile-leveling/) route data
-- 🎨 **Color-coded steps** - Visual highlighting like the original
-- ⌨️ **Manual navigation** - Previous/Next step buttons
-- 🪟 **Resizable overlay** - Adjust to your screen layout
-- 🐧 **Pure Linux** - No Wine, no emulation, just native Qt6
+Linux overlay for Path of Exile leveling - tracks your progress automatically.
 
 ## Installation
 
-### Dependencies
-
-**Arch/CachyOS:**
 ```bash
-paru -S python-pyqt6 python-watchdog
-```
+# Dependencies
+pip install PyQt6 watchdog --break-system-packages
 
-**Debian/Ubuntu:**
-```bash
-sudo apt install python3-pyqt6 python3-watchdog
-```
+# Clone
+git clone https://github.com/sandrigo/tuxonthebeach.git
+cd tuxonthebeach
 
-**Fedora:**
-```bash
-sudo dnf install python3-qt6 python3-watchdog
-```
-
-### Run
-```bash
-python tuxonthebeach.py
+# Run
+python3 tuxonthebeach.py
 ```
 
 ## Usage
 
-### 1. Import Route
-- Open the [exile-leveling](https://heartofphos.github.io/exile-leveling/) Website
-- Select your build/route.
-- Click the menu with three lines (top right).
-- Choose "3rd Party Export" to copy the code to clipboard.
-- Paste the code into TuxontheBeach overlay via 📋 button.
+1. **Import Route**: Click ⬇ → paste JSON from [exile-leveling.io](https://heartofphos.github.io/exile-leveling/)
+2. **Auto-Track**: Automatically follows your zone changes in POE
+3. **Navigate**: Use ◄ ► buttons or let it auto-advance
 
-### 2. Play & Track
-- Start Path of Exile
-- Overlay auto-updates when you enter new zones
-- Use **◄/►** buttons for manual step navigation
+## Always-On-Top Fix (KDE Plasma + Wayland)
 
-## Compatibility
+Overlay goes behind POE? Fix with KDE Window Rule:
 
-✅ **Works with:**
-- Native Linux PoE client
-- Steam Proton
-- Custom Steam library locations
-- Standard and non-standard PoE installations
+```
+System Settings > Window Management > Window Rules > Add New
 
-📂 **Auto-detects Client.txt in:**
-- `~/.local/share/Steam/...`
-- `/run/media/.../Steam Games/...`
-- Proton wine prefixes
-- Custom paths
+Window matching:
+  Window class (application): "Exactly" → "tuxonthebeach.py"
+  
+Appearance & Fixes:
+  Layer: "Force" → "On-Screen Display"
+  Keep above: "Force" → "Yes"
+```
 
-## Wayland Support
+## Features
 
-On Wayland, window dragging requires XWayland. The tool auto-detects Wayland and forces XCB backend for full compatibility.
+- 💎 Gem overlay (toggle with 💎 button)
+- 🗺️ Auto zone detection via Client.txt
+- 💾 Progress auto-save
+- 🎨 Color-coded objectives
+- ⚡ Fast & minimal UI
 
-**Alternative for pure Wayland:** Create a KDE window rule to enable manual positioning.
+## Files
 
-## Development
+All 4 files must be in the same directory:
+- `tuxonthebeach.py`
+- `gems.json`
+- `areas.json`
+- `quests.json`
 
-Built with Claude (Anthropic) as a quick solution to bring leveling helper functionality to Linux.
-
-**Tech Stack:**
-- Python 3
-- PyQt6
-- watchdog (file monitoring)
+Data from [HeartofPhos/exile-leveling](https://github.com/HeartofPhos/exile-leveling)
 
 ## Credits
 
-- **Inspired by:** [Exile-UI](https://github.com/Lailloken/Exile-UI) by Lailloken
-- **Route data:** [exile-leveling](https://github.com/HeartofPhos/exile-leveling) by HeartofPhos
-- **Developed with:** Claude (Anthropic AI)
+Inspired by:
+- [Exile-Leveling](https://heartofphos.github.io/exile-leveling/) by HeartofPhos
+- [Exile-UI](https://github.com/Lailloken/Exile-UI) by Lailloken
 
 ## License
 
-MIT License - See [LICENSE](LICENSE) file
-
----
-
-Made with ❤️ for the Linux PoE community
+MIT
