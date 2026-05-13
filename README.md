@@ -71,7 +71,6 @@ All settings persist to `~/.config/tuxonthebeach/config.json`.
 - 💎 **Inline gem overlay** showing the next 3 gems, with smooth slide animation
 - 🎯 **Dynamic font fitting** — long steps auto-shrink to fit the window, no scrolling
 - 🔒 **Hide-titlebar = lock** — collapses the header AND keeps the window perfectly anchored at the bottom edge, so a content/font change can't shift it out from under the cursor
-- ⬆️ **Grows upward** — when content changes or you resize, the bottom edge stays put and the window expands toward the top, away from your game HUD
 - 👥 **Multi-character profiles** — name your character in settings, get a dedicated progress file
 - 💾 **Position, size, opacity, font, gem toggle, titlebar state — all persisted** between sessions
 - 🎨 **Adjustable opacity** with live preview
@@ -91,15 +90,26 @@ All settings persist to `~/.config/tuxonthebeach/config.json`.
 
 ## Files
 
-All four files must live in the same directory:
+All files must live in the same directory:
 
 - `tuxonthebeach_gtk.py` — GTK4 version (recommended)
 - `tuxonthebeach.py` — PyQt6 fallback
+- `update_data.py` — pulls latest `areas.json` / `gems.json` / `quests.json` from upstream
 - `gems.json`
 - `areas.json`
 - `quests.json`
 
 Data sourced from [HeartofPhos/exile-leveling](https://github.com/HeartofPhos/exile-leveling).
+
+### Updating game data (new PoE patch)
+
+When a new league drops (e.g. 3.27 → 3.28), refresh the JSONs with:
+
+```bash
+python3 update_data.py
+```
+
+The script checks each file's git blob SHA against upstream, downloads only what changed, and prints the latest commit (date + message) so you see which patch the data targets. State is kept in `.exile_data_versions.json`. Pass `--force` to re-download regardless. Set `GITHUB_TOKEN` in your env if you hit GitHub's anonymous rate limit.
 
 ## Notes
 
