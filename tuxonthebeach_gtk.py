@@ -1556,8 +1556,7 @@ class OverlayWindow(Gtk.ApplicationWindow):
             rd = data['route_data']
             self.route_data.acts = rd.get('acts', [])
             self.route_data.route_hash = data.get('route_hash', '')
-            # Always rebuild steps from acts so the markup matches this UI (Pango,
-            # not HTML from the PyQt version that may have written progress.json).
+            # Always rebuild steps from acts so the markup matches this UI.
             if self.route_data.acts:
                 self.route_data._build_step_list()
             else:

@@ -2,13 +2,9 @@
 
 Linux overlay for Path of Exile leveling - tracks your progress automatically.
 
-Two flavors:
-- **`tuxonthebeach_gtk.py`** — GTK4 + `wlr-layer-shell`. Native Wayland, no compositor hacks. **Recommended.**
-- **`tuxonthebeach.py`** — Original PyQt6 build. Kept as a fallback for X11 or compositors that don't support layer-shell.
+GTK4 + `wlr-layer-shell` build. Native Wayland, no compositor hacks.
 
 ## Installation
-
-### GTK4 version (recommended for Wayland)
 
 ```bash
 # Arch / CachyOS
@@ -24,13 +20,6 @@ python3 tuxonthebeach_gtk.py
 ```
 
 Compatible compositors: **niri, sway, Hyprland, river, KDE Plasma**. GNOME/Mutter isn't supported (no layer-shell).
-
-### PyQt6 fallback (X11 / GNOME / other)
-
-```bash
-pip install PyQt6 watchdog --break-system-packages
-python3 tuxonthebeach.py
-```
 
 ## Usage
 
@@ -78,22 +67,21 @@ All settings persist to `~/.config/tuxonthebeach/config.json`.
 
 ## Compositor support
 
-| Compositor | GTK version | PyQt fallback |
-|---|---|---|
-| niri | ✅ | ⚠️ via XWayland |
-| sway | ✅ | ⚠️ via XWayland |
-| Hyprland | ✅ | ⚠️ via XWayland |
-| river | ✅ | ⚠️ via XWayland |
-| KDE Plasma (Wayland) | ✅ | ✅ (with window rules) |
-| GNOME / Mutter | ❌ (no layer-shell) | ⚠️ via XWayland |
-| X11 anything | ❌ | ✅ |
+| Compositor | Supported |
+|---|---|
+| niri | ✅ |
+| sway | ✅ |
+| Hyprland | ✅ |
+| river | ✅ |
+| KDE Plasma (Wayland) | ✅ |
+| GNOME / Mutter | ❌ (no layer-shell) |
+| X11 anything | ❌ |
 
 ## Files
 
 All files must live in the same directory:
 
-- `tuxonthebeach_gtk.py` — GTK4 version (recommended)
-- `tuxonthebeach.py` — PyQt6 fallback
+- `tuxonthebeach_gtk.py` — the overlay
 - `update_data.py` — pulls latest `areas.json` / `gems.json` / `quests.json` from upstream
 - `gems.json`
 - `areas.json`
@@ -114,14 +102,7 @@ The script checks each file's git blob SHA against upstream, downloads only what
 ## Notes
 
 - Suppresses GTK4 Vulkan resize warnings by setting `GSK_RENDERER=gl` automatically — override with your own env var if needed.
-- The GTK version auto-relinks `libgtk4-layer-shell.so` via `LD_PRELOAD` on first launch (a quirk of layer-shell + Python imports).
-- KDE Plasma users on the PyQt fallback may still need the **Always-On-Top** window rule:
-  ```
-  System Settings → Window Management → Window Rules → Add New
-    Window class (application): "Exactly" → "tuxonthebeach.py"
-    Layer: "Force" → "On-Screen Display"
-    Keep above: "Force" → "Yes"
-  ```
+- Auto-relinks `libgtk4-layer-shell.so` via `LD_PRELOAD` on first launch (a quirk of layer-shell + Python imports).
 
 ## Credits
 
