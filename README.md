@@ -1,6 +1,10 @@
 # TuxontheBeach
 
-Linux overlay for Path of Exile leveling - tracks your progress automatically.
+<p align="center">
+  <img src="tuxonthebeach.png" alt="TuxontheBeach — Linux-native PoE1 leveling helper" width="480">
+</p>
+
+Linux overlay for Path of Exile leveling — tracks your progress automatically.
 
 GTK4 + `wlr-layer-shell` build. Native Wayland, no compositor hacks.
 
