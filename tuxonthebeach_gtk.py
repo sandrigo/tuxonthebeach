@@ -12,7 +12,9 @@ import sys
 import os
 import glob
 import base64
+import shlex
 import shutil
+import signal
 import subprocess
 import threading
 import time
@@ -754,6 +756,70 @@ def copy_text_everywhere(text):
     return reached, problems
 
 
+# ── External tools launcher ──────────────────────────────────────────
+# User-configured programs (config.json → "tools": [{"name", "cmd": [...]}])
+# that the overlay can start and stop. Nothing tool-specific lives here.
+
+def _tool_marker(cmd):
+    """The argv element that identifies a running instance: the script for
+    interpreters (python3 foo.py), else the program itself."""
+    if len(cmd) > 1 and os.path.basename(cmd[0]).startswith(("python", "bash", "sh", "node")):
+        return os.path.realpath(os.path.expanduser(cmd[1]))
+    return os.path.realpath(os.path.expanduser(cmd[0])) if cmd else ""
+
+
+def tool_pids(cmd):
+    """PIDs of running instances — also ones started outside the overlay."""
+    marker = _tool_marker(cmd)
+    if not marker:
+        return []
+    uid, me, pids = os.getuid(), os.getpid(), []
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit() or int(pid) == me:
+            continue
+        try:
+            if os.stat(f"/proc/{pid}").st_uid != uid:
+                continue
+            with open(f"/proc/{pid}/cmdline", "rb") as f:
+                argv = [a.decode(errors="ignore") for a in f.read().split(b"\0") if a]
+        except OSError:
+            continue
+        if any(a == marker or os.path.realpath(a) == marker for a in argv[:3]):
+            pids.append(int(pid))
+    return pids
+
+
+def start_tool(cmd):
+    env = dict(os.environ)
+    # Our layer-shell LD_PRELOAD re-exec must not leak into other programs.
+    for k in ("LD_PRELOAD", "TUXONTHEBEACH_LAYER_PRELOADED"):
+        env.pop(k, None)
+    argv = [os.path.expanduser(a) for a in cmd]
+    subprocess.Popen(argv, env=env, start_new_session=True,
+                     cwd=os.path.dirname(_tool_marker(cmd)) or None,
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def stop_tool(cmd):
+    pids = tool_pids(cmd)
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            pass
+
+    def force():
+        for pid in tool_pids(cmd):
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                pass
+        return False
+    if pids:
+        GLib.timeout_add(2500, force)
+    return len(pids)
+
+
 def poe_quote(rx):
     """PoE's search box treats a space as AND between separate terms, so a
     regex that contains a space must be wrapped in quotes as a whole —
@@ -1365,6 +1431,7 @@ class OverlayWindow(Gtk.ApplicationWindow):
         self._preview_dismissed = set()
         self.links_win = None
         self.regex_win = None
+        self.tools_win = None
         self.current_step_index = 0
         self.log_watcher = None
         self.observer = None
@@ -1472,6 +1539,12 @@ class OverlayWindow(Gtk.ApplicationWindow):
         settings_btn.add_css_class("icon-btn")
         settings_btn.connect("clicked", lambda b: self.show_settings())
         header.append(settings_btn)
+
+        tools_btn = Gtk.Button(label="🧰")
+        tools_btn.set_tooltip_text("Tools — start/stop your own programs")
+        tools_btn.add_css_class("icon-btn")
+        tools_btn.connect("clicked", lambda b: self.toggle_tools_window())
+        header.append(tools_btn)
 
         about_btn = Gtk.Button(label="?")
         about_btn.set_tooltip_text("About")
@@ -2192,6 +2265,259 @@ class OverlayWindow(Gtk.ApplicationWindow):
     # ── Gem links popout ─────────────────────────────────────────────
 
     # ── Regex popout ─────────────────────────────────────────────────
+
+    # ── Tools popout ─────────────────────────────────────────────────
+
+    def toggle_tools_window(self):
+        if self.tools_win:
+            win, self.tools_win = self.tools_win, None
+            win.destroy()
+            return False
+        win = Gtk.Window()
+        win.add_css_class("links-window")
+        LayerShell.init_for_window(win)
+        LayerShell.set_layer(win, LayerShell.Layer.OVERLAY)
+        LayerShell.set_namespace(win, "tuxonthebeach-tools")
+        LayerShell.set_keyboard_mode(win, LayerShell.KeyboardMode.NONE)
+        LayerShell.set_anchor(win, LayerShell.Edge.TOP, True)
+        LayerShell.set_anchor(win, LayerShell.Edge.LEFT, True)
+        out_w, _ = self._get_output_size()
+        left = LayerShell.get_margin(self, LayerShell.Edge.LEFT)
+        top = LayerShell.get_margin(self, LayerShell.Edge.TOP)
+        width = 300
+        x = left + self._fixed_width - width
+        LayerShell.set_margin(win, LayerShell.Edge.LEFT, max(0, min(x, out_w - width)))
+        LayerShell.set_margin(win, LayerShell.Edge.TOP, top + 34)
+        win.set_default_size(width, -1)
+
+        root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        root.add_css_class("links-root")
+        win.set_child(root)
+        head = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        head.add_css_class("links-header")
+        title = Gtk.Label(label="TOOLS")
+        title.add_css_class("links-title")
+        title.set_xalign(0)
+        title.set_hexpand(True)
+        head.append(title)
+        close = Gtk.Button(label="✕")
+        close.add_css_class("icon-btn")
+        close.add_css_class("danger")
+        close.connect("clicked", lambda b: self.toggle_tools_window())
+        head.append(close)
+        root.append(head)
+
+        self.tools_list = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        self.tools_list.set_margin_bottom(6)
+        root.append(self.tools_list)
+
+        self.tools_win = win
+        self._fill_tools_list()
+        GLib.timeout_add(1000, self._tools_tick)
+        win.present()
+        return False
+
+    def _tools_tick(self):
+        if not self.tools_win:
+            return False
+        self._fill_tools_list()
+        return True
+
+    def _fill_tools_list(self):
+        child = self.tools_list.get_first_child()
+        while child:
+            nxt = child.get_next_sibling()
+            self.tools_list.remove(child)
+            child = nxt
+        tools = self.config.setdefault("tools", [])
+        if not tools:
+            hint = Gtk.Label(label="No tools yet — add a program or script below.")
+            hint.add_css_class("links-hint")
+            hint.set_xalign(0)
+            self.tools_list.append(hint)
+        for i, tool in enumerate(tools):
+            cmd = tool.get("cmd", [])
+            running = bool(tool_pids(cmd))
+            row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+            row.add_css_class("regex-row")
+            dot = Gtk.Label()
+            dot.set_markup('<span color="#2ecc71">●</span>' if running else '<span color="#666">○</span>')
+            row.append(dot)
+            name = Gtk.Label(label=tool.get("name", "tool"))
+            name.add_css_class("regex-name")
+            name.set_xalign(0)
+            name.set_hexpand(True)
+            name.set_ellipsize(Pango.EllipsizeMode.END)
+            name.set_tooltip_text(shlex.join(cmd))
+            row.append(name)
+            btn = Gtk.Button(label="■ Close" if running else "▶ Open")
+            btn.add_css_class("icon-btn")
+            btn.add_css_class("danger" if running else "accent")
+            btn.connect("clicked", lambda b, t=tool: self._toggle_tool(t))
+            row.append(btn)
+            rm = Gtk.Button(label="✕")
+            rm.add_css_class("icon-btn")
+            rm.set_tooltip_text("Remove from the list (doesn't touch the program)")
+            rm.connect("clicked", lambda b, i=i: self._remove_tool(i))
+            row.append(rm)
+            self.tools_list.append(row)
+        add = Gtk.Button(label="＋ Add program / script…")
+        add.add_css_class("icon-btn")
+        add.set_margin_start(8)
+        add.set_margin_end(8)
+        add.set_margin_top(4)
+        add.connect("clicked", lambda b: self._add_tool())
+        self.tools_list.append(add)
+
+    def _toggle_tool(self, tool):
+        cmd = tool.get("cmd", [])
+        name = tool.get("name", "tool")
+        if tool_pids(cmd):
+            n = stop_tool(cmd)
+            self._flash(f"Closed {name}" + (f" ({n} processes)" if n > 1 else ""))
+        else:
+            try:
+                start_tool(cmd)
+                self._flash(f"Started {name}")
+            except Exception as e:
+                self._flash(f"Can't start {name}: {e}")
+        GLib.timeout_add(600, lambda: (self.tools_win and self._fill_tools_list(), False)[1])
+
+    def _remove_tool(self, i):
+        del self.config["tools"][i]
+        save_config(self.config)
+        self._fill_tools_list()
+
+    def _add_tool(self):
+        """Own tiny file browser as a layer-shell popout. The system file
+        dialog (portal) opens as a normal window — behind a fullscreen game,
+        where nobody sees it."""
+        if getattr(self, 'pick_win', None):
+            self.pick_win.destroy()
+        win = Gtk.Window()
+        win.add_css_class("links-window")
+        LayerShell.init_for_window(win)
+        LayerShell.set_layer(win, LayerShell.Layer.OVERLAY)
+        LayerShell.set_namespace(win, "tuxonthebeach-picker")
+        LayerShell.set_keyboard_mode(win, LayerShell.KeyboardMode.ON_DEMAND)
+        LayerShell.set_anchor(win, LayerShell.Edge.TOP, True)
+        LayerShell.set_anchor(win, LayerShell.Edge.LEFT, True)
+        tl = LayerShell.get_margin(self.tools_win, LayerShell.Edge.LEFT) if self.tools_win else 100
+        tt = LayerShell.get_margin(self.tools_win, LayerShell.Edge.TOP) if self.tools_win else 100
+        out_w, _ = self._get_output_size()
+        width = 380
+        x = tl + 306 if tl + 306 + width <= out_w else max(0, tl - width - 6)
+        LayerShell.set_margin(win, LayerShell.Edge.LEFT, x)
+        LayerShell.set_margin(win, LayerShell.Edge.TOP, tt)
+        win.set_default_size(width, -1)
+
+        root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        root.add_css_class("links-root")
+        win.set_child(root)
+        head = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        head.add_css_class("links-header")
+        title = Gtk.Label(label="ADD TOOL")
+        title.add_css_class("links-title")
+        title.set_xalign(0)
+        title.set_hexpand(True)
+        head.append(title)
+        close = Gtk.Button(label="✕")
+        close.add_css_class("icon-btn")
+        close.add_css_class("danger")
+        close.connect("clicked", lambda b: self._close_picker())
+        head.append(close)
+        root.append(head)
+
+        self.pick_entry = Gtk.Entry()
+        self.pick_entry.add_css_class("regex-entry")
+        self.pick_entry.set_margin_start(8)
+        self.pick_entry.set_margin_end(8)
+        self.pick_entry.set_margin_top(6)
+        self.pick_entry.set_placeholder_text("path to a program or script, Enter")
+        self.pick_entry.connect("activate", lambda e: self._pick_path(e.get_text()))
+        root.append(self.pick_entry)
+
+        scroll = Gtk.ScrolledWindow()
+        scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        scroll.set_min_content_height(320)
+        scroll.set_max_content_height(420)
+        self.pick_list = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        self.pick_list.set_margin_bottom(6)
+        scroll.set_child(self.pick_list)
+        root.append(scroll)
+
+        self.pick_win = win
+        start = self.config.get("tools_last_dir") or str(Path.home())
+        self._pick_show(start if os.path.isdir(start) else str(Path.home()))
+        win.present()
+
+    def _close_picker(self):
+        win, self.pick_win = getattr(self, 'pick_win', None), None
+        if win:
+            win.destroy()
+
+    @staticmethod
+    def _is_runnable(path):
+        return path.endswith((".py", ".sh")) or (os.path.isfile(path) and os.access(path, os.X_OK))
+
+    def _pick_show(self, folder):
+        folder = os.path.abspath(os.path.expanduser(folder))
+        self._pick_dir = folder
+        home = str(Path.home())
+        self.pick_entry.set_text(folder.replace(home, "~", 1) + "/")
+        child = self.pick_list.get_first_child()
+        while child:
+            nxt = child.get_next_sibling()
+            self.pick_list.remove(child)
+            child = nxt
+        try:
+            names = sorted(os.listdir(folder), key=str.lower)
+        except OSError as e:
+            names = []
+            self._flash(f"Can't open {folder}: {e}")
+        dirs = [n for n in names if not n.startswith(".") and os.path.isdir(os.path.join(folder, n))]
+        files = [n for n in names if not n.startswith(".") and self._is_runnable(os.path.join(folder, n))]
+        entries = ([("⬆  ..", os.path.dirname(folder), True)] if folder != "/" else []) + \
+                  [(f"📁  {n}", os.path.join(folder, n), True) for n in dirs] + \
+                  [(f"▶  {n}", os.path.join(folder, n), False) for n in files]
+        for label, path, is_dir in entries:
+            b = Gtk.Button(label=label)
+            b.add_css_class("icon-btn")
+            b.get_child().set_xalign(0)
+            b.set_margin_start(8)
+            b.set_margin_end(8)
+            if not is_dir:
+                b.add_css_class("accent")
+            b.connect("clicked", lambda _b, p=path, d=is_dir: self._pick_show(p) if d else self._pick_path(p))
+            self.pick_list.append(b)
+        if not files and not dirs:
+            hint = Gtk.Label(label="  (nothing runnable here)")
+            hint.add_css_class("links-hint")
+            hint.set_xalign(0)
+            self.pick_list.append(hint)
+
+    def _pick_path(self, text):
+        path = os.path.abspath(os.path.expanduser(text.strip()))
+        if os.path.isdir(path):
+            self._pick_show(path)
+            return
+        if not os.path.isfile(path):
+            self._flash(f"Not found: {text.strip()}")
+            return
+        if path.endswith(".py"):
+            cmd = ["python3", path]
+        elif path.endswith(".sh"):
+            cmd = ["bash", path]
+        else:
+            cmd = [path]
+        self.config.setdefault("tools", []).append(
+            {"name": os.path.splitext(os.path.basename(path))[0], "cmd": cmd})
+        self.config["tools_last_dir"] = os.path.dirname(path)
+        save_config(self.config)
+        self._close_picker()
+        self._flash(f"Added {os.path.basename(path)}")
+        if self.tools_win:
+            self._fill_tools_list()
 
     def toggle_regex_window(self):
         if self.regex_win:
@@ -3297,6 +3623,9 @@ class OverlayWindow(Gtk.ApplicationWindow):
 
     def _on_close_request(self, window):
         self._close_links_window()
+        self._close_picker()
+        if self.tools_win:
+            self.toggle_tools_window()
         if self.regex_win:
             self.toggle_regex_window()
         self.save_progress()
