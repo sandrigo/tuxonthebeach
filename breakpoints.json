@@ -1,0 +1,65 @@
+[
+  {
+    "id": "hailrake",
+    "level": 4,
+    "label": "Hailrake",
+    "areas": ["1_1_2a"],
+    "match": {"kill": "Hailrake"}
+  },
+  {
+    "id": "dweller",
+    "level": 8,
+    "label": "The Dweller of the Deep",
+    "areas": ["1_1_4_0"],
+    "match": {"kill": "The Dweller of the Deep"}
+  },
+  {
+    "id": "climb",
+    "level": 7.5,
+    "label": "The Climb",
+    "areas": ["1_1_6"],
+    "match": {"enter": "1_1_6"}
+  },
+  {
+    "id": "docks",
+    "level": 25,
+    "label": "The Docks",
+    "areas": ["1_3_9"],
+    "match": {"enter": "1_3_9"}
+  },
+  {
+    "id": "dialla",
+    "level": 27,
+    "label": "Lady Dialla (Solaris 2)",
+    "areas": ["1_3_8_2"],
+    "match": {"generic": "Lady Dialla", "in_area": "1_3_8_2"}
+  },
+  {
+    "id": "piety",
+    "level": 29,
+    "label": "Piety (Lunaris 2)",
+    "areas": ["1_3_14_2"],
+    "match": {"kill": "Piety", "in_area": "1_3_14_2"}
+  },
+  {
+    "id": "library",
+    "level": 31,
+    "label": "The Library",
+    "areas": ["1_3_17_1"],
+    "match": {"enter": "1_3_17_1"}
+  },
+  {
+    "id": "mines2",
+    "level": 33,
+    "label": "The Mines Level 2",
+    "areas": ["1_4_3_2"],
+    "match": {"enter": "1_4_3_2"}
+  },
+  {
+    "id": "lab",
+    "level": 34,
+    "label": "Labyrinth (normal)",
+    "areas": ["Labyrinth_Airlock"],
+    "match": {"ascend": "normal"}
+  }
+]

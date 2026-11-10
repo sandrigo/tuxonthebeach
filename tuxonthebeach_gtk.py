@@ -11,6 +11,14 @@ import re
 import sys
 import os
 import glob
+import base64
+import shutil
+import subprocess
+import threading
+import time
+import urllib.request
+import xml.etree.ElementTree as ET
+import zlib
 from pathlib import Path
 
 import gi
@@ -72,6 +80,144 @@ AREA_DATA = _load_json("areas.json")
 QUEST_DATA = _load_json("quests.json")
 
 
+# Vendor price by the gem's required level — same thresholds exile-leveling
+# uses (web/src/components/GemCost). Quest rewards are free.
+GEM_COST_TIERS = [
+    (8, "Wisdom", "#c8b88a"),
+    (16, "Transmute", "#8ec5ff"),
+    (28, "Alteration", "#7fb3ff"),
+    (38, "Chance", "#e0e0e0"),
+    (999, "Alchemy", "#ffd27f"),
+]
+
+_GEM_BY_NAME = {}
+
+
+def gem_info(gem_id=None, name=None):
+    info = GEM_DATA.get(gem_id) if gem_id else None
+    if info is None and name:
+        if not _GEM_BY_NAME:
+            for g in GEM_DATA.values():
+                _GEM_BY_NAME.setdefault(g.get("name", "").lower(), g)
+        n = name.lower()
+        # PoB's nameSpec drops the " Support" suffix.
+        info = _GEM_BY_NAME.get(n) or _GEM_BY_NAME.get(f"{n} support")
+    return info
+
+
+def gem_cost(gem_id=None, name=None):
+    """(label, color) of the vendor price, or None if the gem is unknown."""
+    info = gem_info(gem_id, name)
+    if not info or info.get("required_level") is None:
+        return None
+    lvl = int(info["required_level"])
+    for limit, label, color in GEM_COST_TIERS:
+        if lvl < limit:
+            return label, color
+    return None
+
+
+def gem_cost_markup(gem_id=None, name=None, count=1):
+    cost = gem_cost(gem_id, name)
+    if not cost:
+        return ""
+    label, color = cost
+    qty = f"{count}× " if count and int(count) > 1 else ""
+    return f'<span color="{color}"><small>{qty}{esc(label)}</small></span>'
+
+
+_GEM_VENDORS = None
+
+
+def gem_vendors(gem_id, cls=None):
+    """Where a gem can be bought: [(act, quest, npc, all_classes)] in game
+    order, filtered to `cls` (PoB className). From quests.json vendor offers;
+    an empty class list there means every class (Siosa, Lilly Roth)."""
+    global _GEM_VENDORS
+    if _GEM_VENDORS is None:
+        _GEM_VENDORS = {}
+        for q in QUEST_DATA.values():
+            try:
+                act = int(q.get("act") or 0)
+            except ValueError:
+                act = 0
+            for offer in q.get("reward_offers", {}).values():
+                for gid, v in offer.get("vendor", {}).items():
+                    _GEM_VENDORS.setdefault(gid, []).append(
+                        (act, q.get("name", ""), v.get("npc", ""), v.get("classes", [])))
+        for lst in _GEM_VENDORS.values():
+            lst.sort(key=lambda x: x[0])
+    out = []
+    for act, qname, npc, classes in _GEM_VENDORS.get(gem_id, []):
+        if cls and classes and cls not in classes:
+            continue
+        out.append((act, qname, npc, not classes))
+    return out
+
+
+def gem_where_text(gem_id, cls=None):
+    srcs = gem_vendors(gem_id, cls)
+    if not srcs:
+        return "Vendor: not sold in the campaign for this class"
+    act, qname, npc, _ = srcs[0]
+    lines = [f"Buy: {npc} (Act {act}) after “{qname}”"]
+    fallback = next((x for x in srcs if x[3]), None)
+    if fallback and fallback is not srcs[0]:
+        a2, q2, n2, _ = fallback
+        lines.append(f"Missed it? {n2} (Act {a2}) after “{q2}” sells it to every class")
+    return "\n".join(lines)
+
+
+def _load_user_list(name):
+    """Load a bundled list file. A user copy in ~/.config/tuxonthebeach/ wins
+    over the bundled default so people can tune it without touching the repo."""
+    user_file = CONFIG_DIR / name
+    try:
+        if user_file.exists():
+            with open(user_file, "r") as f:
+                return json.load(f)
+    except Exception as e:
+        print(f"Warning: failed to load {user_file}: {e}")
+    data = _load_json(name)
+    return data if isinstance(data, list) else []
+
+
+# Set by `--level N` on the command line: pretend to be that level so the
+# breakpoints / tips / gem-set picks for it can be previewed.
+PREVIEW_LEVEL = None
+
+BREAKPOINTS = _load_user_list("breakpoints.json")
+TIPS = _load_user_list("tips.json")
+
+
+def fmt_level(lv):
+    """7.5 → '7½', 25 → '25'."""
+    if lv is None:
+        return "?"
+    lv = float(lv)
+    whole = int(lv)
+    return f"{whole}½" if lv - whole >= 0.5 else str(whole)
+
+
+def _match_breakpoint(match, parts, area_ctx):
+    """True if a route step's parts satisfy a breakpoint matcher."""
+    if 'in_area' in match and match['in_area'] != area_ctx:
+        return False
+    for part in parts:
+        if not isinstance(part, dict):
+            continue
+        t = part.get("type")
+        if 'kill' in match and t == "kill" and part.get("value") == match['kill']:
+            return True
+        if 'generic' in match and t == "generic" and part.get("value") == match['generic']:
+            return True
+        if 'enter' in match and t == "enter" and part.get("areaId") == match['enter']:
+            return True
+        if 'ascend' in match and t == "ascend" and part.get("version") == match['ascend']:
+            return True
+    return False
+
+
 def esc(s):
     return GLib.markup_escape_text(str(s))
 
@@ -88,6 +234,8 @@ class RouteData:
         self.zone_steps = {}
         self.all_steps = []
         self.route_hash = ""
+        self.bp_anchors = {}   # breakpoint id → step index in all_steps
+        self.quest_gems = set()  # gem ids the route gets as quest rewards
 
     def load_from_json(self, json_data):
         try:
@@ -114,15 +262,44 @@ class RouteData:
     def _build_step_list(self):
         self.all_steps = []
         self.zone_steps = {}
+        self.bp_anchors = {}
+        self.quest_gems = set()
         self.acts = [a for a in self.acts if isinstance(a, dict)]
 
         current_zone = None
+        area_ctx = None  # area id we're in at this point of the route
+        area_first = {}  # area id → first step index that reaches it
         for act in self.acts:
             act_name = act.get("name", "Unknown")
             for step in act.get("steps", []):
                 zones = self._extract_zones(step)
                 if zones:
                     current_zone = zones[-1]
+
+                if step.get("type") == "gem_step" and step.get("rewardType", "quest") == "quest":
+                    gid = step.get("requiredGem", {}).get("id")
+                    if gid:
+                        self.quest_gems.add(gid)
+
+                parts = [p for p in step.get("parts", []) if isinstance(p, dict)]
+                for p in parts:
+                    if p.get("type") == "enter" and p.get("areaId"):
+                        area_ctx = p["areaId"]
+                    elif p.get("type") in ("waypoint_use", "portal_use") and p.get("dstAreaId"):
+                        area_ctx = p["dstAreaId"]
+                if area_ctx and area_ctx not in area_first:
+                    area_first[area_ctx] = len(self.all_steps)
+                all_parts = list(parts)
+                for sub in step.get("subSteps", []):
+                    all_parts.extend(p for p in sub.get("parts", []) if isinstance(p, dict))
+                for bp in BREAKPOINTS:
+                    bid = bp.get("id")
+                    if bid in self.bp_anchors:
+                        continue  # first occurrence only (Act 4 Dialla/Piety etc.)
+                    if _match_breakpoint(bp.get("match", {}), all_parts, area_ctx):
+                        # Empty steps are skipped below, so this points at the
+                        # next visible step — close enough.
+                        self.bp_anchors[bid] = len(self.all_steps)
 
                 step_text = self._format_step(step)
                 if not step_text:
@@ -135,6 +312,29 @@ class RouteData:
                 for zone in zones:
                     self.zone_steps.setdefault(zone, []).append(len(self.all_steps))
                 self.all_steps.append(step_data)
+
+        self._fill_missing_anchors(area_first)
+
+    def _fill_missing_anchors(self, area_first):
+        """Routes differ per build/settings (optional quests, different gem
+        stops, skipped Library…). Anchors are matched by content, not by step
+        number; if the exact step isn't in this route, fall back to the first
+        time the route reaches the breakpoint's area, and failing that, slot
+        it in right before the next breakpoint that was found."""
+        for bp in BREAKPOINTS:
+            bid = bp.get("id")
+            if bid in self.bp_anchors:
+                continue
+            hits = [area_first[a] for a in bp.get("areas", []) if a in area_first]
+            if hits:
+                self.bp_anchors[bid] = min(hits)
+        nxt = None
+        for bp in reversed(BREAKPOINTS):
+            bid = bp.get("id")
+            if bid in self.bp_anchors:
+                nxt = self.bp_anchors[bid]
+            elif nxt is not None:
+                self.bp_anchors[bid] = nxt
 
     def _extract_zones(self, step):
         zones = []
@@ -187,10 +387,16 @@ class RouteData:
 
         source = "Quest" if reward_type == "quest" else "Vendor"
         source_color = "#f39c12" if reward_type == "quest" else "#95a5a6"
+        source_markup = f'<span color="{source_color}"><small>({source}'
+        if reward_type != "quest":
+            price = gem_cost_markup(gem_id, gem_name, step.get("count", gem.get("count", 1)))
+            if price:
+                source_markup += f' · </small></span>{price}<span color="{source_color}"><small>'
+        source_markup += ')</small></span>'
 
         return (
             f'<span color="{color}" weight="bold">{icon} {esc(gem_name)}</span> '
-            f'<span color="{source_color}"><small>({source})</small></span>'
+            f'{source_markup}'
         )
 
     def _format_parts(self, parts):
@@ -245,11 +451,431 @@ class RouteData:
         return indices[0] if indices else None
 
 
-class LogWatcher(FileSystemEventHandler):
-    """Tails PoE Client.txt for zone-change events."""
+# ── Path of Building import ──────────────────────────────────────────
+# The exile-leveling export only lists *which* gems to buy, not how they're
+# linked. The socket groups live in the PoB code itself, so we read that.
 
-    def __init__(self, callback, custom_path=None):
+POB_LINK_PATTERNS = [
+    (re.compile(r'pobb\.in/(?:u/[^/\s]+/)?([A-Za-z0-9_-]+)'), "https://pobb.in/{}/raw"),
+    (re.compile(r'pastebin\.com/(?:raw/)?([A-Za-z0-9]+)'), "https://pastebin.com/raw/{}"),
+    (re.compile(r'poe\.ninja/pob/(?:raw/)?([A-Za-z0-9]+)'), "https://poe.ninja/pob/raw/{}"),
+]
+
+def pob_raw_url(text):
+    """Map a pobb.in / pastebin / poe.ninja link to its raw-code URL."""
+    text = text.strip()
+    if not text.startswith(("http://", "https://")) and "/" not in text:
+        return None
+    for rx, tmpl in POB_LINK_PATTERNS:
+        m = rx.search(text)
+        if m:
+            return tmpl.format(m.group(1))
+    return None
+
+
+def fetch_pob_code(url):
+    req = urllib.request.Request(url, headers={"User-Agent": "tuxonthebeach"})
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        return resp.read().decode("utf-8", errors="ignore").strip()
+
+
+def decode_pob_code(code):
+    """PoB export string → XML root. Raises ValueError if it isn't one."""
+    code = re.sub(r'\s+', '', code).replace('+', '-').replace('/', '_')
+    try:
+        raw = base64.urlsafe_b64decode(code + "=" * (-len(code) % 4))
+        xml = zlib.decompress(raw)
+        root = ET.fromstring(xml)
+    except Exception as e:
+        raise ValueError(f"not a PoB code ({e})")
+    if root.tag != "PathOfBuilding":
+        raise ValueError("not a PoB code (unexpected XML)")
+    return root
+
+
+def parse_pob_skills(root):
+    """Extract skill sets → socket groups → gems from a PoB XML root."""
+    build = root.find("Build")
+    skills = root.find("Skills")
+    result = {
+        "class": build.get("className", "") if build is not None else "",
+        "ascendancy": build.get("ascendClassName", "") if build is not None else "",
+        "active_set": 0,
+        "sets": [],
+    }
+    if skills is None:
+        return result
+
+    set_nodes = skills.findall("SkillSet")
+    if not set_nodes:  # pre-skill-set PoB: groups sit directly under <Skills>
+        set_nodes = [skills]
+    active_id = skills.get("activeSkillSet")
+
+    for i, sset in enumerate(set_nodes):
+        title = sset.get("title") or f"Set {i + 1}"
+        if sset.get("id") == active_id:
+            result["active_set"] = i
+        groups = []
+        for sk in sset.findall("Skill"):
+            if sk.get("enabled", "true") == "false":
+                continue
+            gems = []
+            for g in sk.findall("Gem"):
+                gem_id = g.get("gemId", "")
+                name = g.get("nameSpec") or g.get("skillId") or gem_id.rsplit("/", 1)[-1]
+                support = "SupportGem" in gem_id or (g.get("skillId") or "").startswith("Support")
+                gems.append({
+                    "name": name,
+                    "support": support,
+                    "gem_id": gem_id,
+                    "enabled": g.get("enabled", "true") != "false",
+                    "level": g.get("level"),
+                })
+            if not gems:
+                continue
+            groups.append({
+                "slot": sk.get("slot") or "",
+                "label": sk.get("label") or "",
+                "gems": gems,
+            })
+        result["sets"].append({"title": title, "groups": groups})
+    return result
+
+
+def skill_set_for_level(pob, level):
+    """Pick the skill set whose title ("1-17", "Lvl 12-31", "70+") covers
+    the level; narrowest range wins. Falls back to PoB's active set."""
+    sets = pob.get("sets", [])
+    if level is not None:
+        best = None
+        for i, sset in enumerate(sets):
+            t = sset.get("title", "")
+            m = re.search(r'(\d+)\s*[-–]\s*(\d+)', t)
+            if m:
+                lo, hi = int(m.group(1)), int(m.group(2))
+            else:
+                # "70+" or "61-Early Maps" → open-ended from that level
+                m = re.search(r'(\d+)\s*(?:\+|[-–]\s*(?=\D|$))', t)
+                if not m:
+                    continue
+                lo, hi = int(m.group(1)), 100
+            if lo <= level <= hi and (best is None or hi - lo < best[0]):
+                best = (hi - lo, i)
+        if best:
+            return best[1]
+    return min(pob.get("active_set", 0), max(0, len(sets) - 1))
+
+
+# ── Regex (PoE search box) ───────────────────────────────────────────
+# Vendor patterns from poe.re (poe/src/utils/OutputString.ts). Socket
+# colours no longer restrict gems (3.29), so only link counts are offered.
+
+REGEX_MAX_LEN = 250   # PoE client search-box limit
+
+# Link patterns are cumulative: "3+" (-[rgbw]-) already matches 4/5/6-links,
+# so the builder picks a *minimum*, never a set of link counts.
+VENDOR_LINKS = {
+    3: "-[rgbw]-",
+    4: "-\\w-.-",
+    5: "(-\\w){4}",
+    6: "(-\\w){5}",
+}
+VENDOR_EXTRAS = [   # (config key, label, raw pattern) — OR'ed with the links
+    ("ms", "Movement speed 10/15%", "Runn|rint"),
+    ("wand", "+1 gem wand", "ll g"),
+    ("phys", "% phys weapon", "d.+cal d"),
+]
+
+
+def links_for_level(level):
+    """Sensible minimum link count for vendor shopping, by item-level socket
+    limits: 4 sockets from ilvl 25, 5 from 35, 6 from 50."""
+    if level is None or level < 25:
+        return 3
+    if level < 35:
+        return 4
+    if level < 50:
+        return 5
+    return 6
+
+
+def combine_vendor_regex(links, extras):
+    """OR everything into one search, poe.re-style: if any part has a space
+    or quote, drop inner quotes and quote the whole thing."""
+    parts = []
+    if links:
+        parts.append(VENDOR_LINKS[links])
+    for key, _label, pattern in VENDOR_EXTRAS:
+        if extras.get(key):
+            parts.append(pattern)
+    rx = "|".join(parts)
+    if '"' in rx or " " in rx:
+        rx = '"' + rx.replace('"', "") + '"'
+    return rx
+
+POERE_GEMS_URL = ("https://raw.githubusercontent.com/veiset/poe.re/master/"
+                  "poe/public/generated/gems/Generated.Gems.ENGLISH.min.json")
+POERE_GEMS_FILE = CONFIG_DIR / "poere_gems_en.json"
+_POERE_TOKENS = None   # lower-cased gem name → poe.re regex token
+
+
+def load_poere_tokens():
+    """poe.re's per-gem shortest unique search tokens. Not bundled (no
+    licence upstream) — fetched once into the config dir on first use."""
+    global _POERE_TOKENS
+    if _POERE_TOKENS is not None:
+        return _POERE_TOKENS
+    try:
+        with open(POERE_GEMS_FILE, "r") as f:
+            data = json.load(f)
+        _POERE_TOKENS = {t["rawText"].lower(): t["regex"] for t in data.get("tokens", [])}
+    except Exception:
+        return None
+    return _POERE_TOKENS
+
+
+def fetch_poere_tokens():
+    req = urllib.request.Request(POERE_GEMS_URL, headers={"User-Agent": "tuxonthebeach"})
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        raw = resp.read()
+    json.loads(raw)  # validate before writing
+    POERE_GEMS_FILE.write_bytes(raw)
+
+
+_ALL_GEM_NAMES = None
+
+
+def _own_gem_token(name):
+    """Fallback without poe.re: shortest line-start prefix of the gem name
+    that no other gem shares ("^chance to b"). Longer than poe.re's tokens
+    but can't hit random mod text in the vendor window."""
+    global _ALL_GEM_NAMES
+    if _ALL_GEM_NAMES is None:
+        _ALL_GEM_NAMES = sorted({g.get("name", "").lower() for g in GEM_DATA.values()})
+    n = name.lower()
+    others = [o for o in _ALL_GEM_NAMES if o != n]
+    for size in range(3, len(n) + 1):
+        pre = n[:size]
+        if pre.endswith(" "):
+            continue
+        if not any(o.startswith(pre) for o in others):
+            return "^" + pre
+    return f"^{n}$"
+
+
+def gem_regex_token(name, support=None):
+    toks = load_poere_tokens() or {}
+    n = name.lower()
+    keys = [f"{n} support", n] if support else [n, f"{n} support"]
+    for k in keys:
+        if k in toks:
+            return toks[k]
+    info = gem_info(None, name)
+    if info is None and support:
+        info = gem_info(None, f"{name} Support")
+    return _own_gem_token(info["name"] if info else name)
+
+
+def build_gem_regex(names):
+    """Join gem tokens poe.re-style, split into chunks that fit the 250-char
+    search box. `names`: gem names or (name, is_support). Returns regexes."""
+    tokens = []
+    for n in names:
+        t = gem_regex_token(*n) if isinstance(n, tuple) else gem_regex_token(n)
+        if t not in tokens:
+            tokens.append(t)
+    chunks, cur = [], []
+    for t in tokens:
+        trial = cur + [t]
+        if len('"' + "|".join(trial) + '"') > REGEX_MAX_LEN and cur:
+            chunks.append(cur)
+            cur = [t]
+        else:
+            cur = trial
+    if cur:
+        chunks.append(cur)
+    return [c[0] if len(c) == 1 and " " not in c[0] else '"' + "|".join(c) + '"' for c in chunks]
+
+
+def gamescope_displays():
+    """X displays of running gamescope sessions (their nested Xwayland).
+    gamescope doesn't sync the host clipboard into its Xwayland, so a copy
+    on the desktop never reaches a game running inside it."""
+    uid = os.getuid()
+    host = os.environ.get("DISPLAY")
+    found = set()
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit():
+            continue
+        try:
+            if os.stat(f"/proc/{pid}").st_uid != uid:
+                continue
+            with open(f"/proc/{pid}/environ", "rb") as f:
+                env = f.read().split(b"\0")
+        except OSError:
+            continue
+        if not any(e.startswith(b"GAMESCOPE_WAYLAND_DISPLAY=") for e in env):
+            continue
+        for e in env:
+            if e.startswith(b"DISPLAY="):
+                d = e[8:].decode(errors="ignore")
+                if d and d != host:
+                    found.add(d)
+    return sorted(found)
+
+
+def copy_text_everywhere(text):
+    """Put text on the desktop clipboard AND into every gamescope Xwayland.
+    Returns (gamescope displays reached, list of problems)."""
+    problems = []
+    if shutil.which("wl-copy") and os.environ.get("WAYLAND_DISPLAY"):
+        try:
+            subprocess.run(["wl-copy", "--", text], timeout=3, check=True,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception as e:
+            problems.append(f"wl-copy: {e}")
+    else:
+        problems.append("wl-copy missing")
+    reached = []
+    displays = gamescope_displays()
+    if displays and not shutil.which("xclip"):
+        problems.append("xclip missing — needed for gamescope")
+    elif displays:
+        for d in displays:
+            try:
+                # xclip forks and serves the selection until someone else
+                # copies; the parent returns right away.
+                subprocess.run(["xclip", "-selection", "clipboard", "-display", d],
+                               input=text.encode(), timeout=3, check=True,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                reached.append(d)
+            except Exception as e:
+                problems.append(f"gamescope {d}: {e}")
+    return reached, problems
+
+
+def poe_quote(rx):
+    """PoE's search box treats a space as AND between separate terms, so a
+    regex that contains a space must be wrapped in quotes as a whole —
+    same rule poe.re applies to its output. Already-quoted input (or a
+    deliberate multi-term search like `"a" "b"`) is left alone."""
+    rx = rx.strip()
+    if " " in rx and '"' not in rx:
+        return f'"{rx}"'
+    return rx
+
+
+class GameKeys:
+    """Sends Ctrl+F, Ctrl+A, Ctrl+V to the focused window via a uinput
+    virtual keyboard. Works inside gamescope (XTEST and wtype don't: gamescope
+    drops XTEST and mistranslates wtype's keymap). Only Ctrl/F/A/V are sent —
+    those keys sit in the same place on QWERTY and QWERTZ; the text itself
+    goes via the clipboard."""
+
+    def __init__(self):
+        self._ui = None
+        self._lock = threading.Lock()
+
+    def available(self):
+        try:
+            import evdev  # noqa: F401
+            return os.access("/dev/uinput", os.W_OK)
+        except ImportError:
+            return bool(shutil.which("ydotool"))
+
+    def _device(self):
+        if self._ui is None:
+            from evdev import UInput, ecodes as e
+            self._ui = UInput({e.EV_KEY: [e.KEY_LEFTCTRL, e.KEY_F, e.KEY_A, e.KEY_V]},
+                              name="tuxonthebeach keyboard")
+            # The compositor — and remappers like keyd, which grab new
+            # keyboards — need a moment; keys sent before that get scrambled.
+            time.sleep(1.5)
+        return self._ui
+
+    def warm_up(self):
+        """Create the device ahead of time (in the background) so the first
+        Send isn't the one that races keyd's grab."""
+        def run():
+            with self._lock:
+                try:
+                    import evdev  # noqa: F401
+                    self._device()
+                except Exception as ex:
+                    print(f"uinput keyboard: {ex}")
+        threading.Thread(target=run, daemon=True).start()
+
+    def _combo_evdev(self, key):
+        from evdev import ecodes as e
+        ui = self._device()
+        k = getattr(e, f"KEY_{key.upper()}")
+        for code, val in ((e.KEY_LEFTCTRL, 1), (k, 1), (k, 0), (e.KEY_LEFTCTRL, 0)):
+            ui.write(e.EV_KEY, code, val)
+            ui.syn()
+            time.sleep(0.025)
+
+    def _combo_ydotool(self, key):
+        codes = {"f": 33, "a": 30, "v": 47}
+        env = dict(os.environ)
+        sock = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), ".ydotool_socket")
+        if os.path.exists(sock):
+            env.setdefault("YDOTOOL_SOCKET", sock)
+        c = codes[key]
+        subprocess.run(["ydotool", "key", "-d", "25", "29:1", f"{c}:1", f"{c}:0", "29:0"],
+                       env=env, timeout=3, check=True,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    def search_and_paste(self):
+        """Ctrl+F (focus search box), Ctrl+A (select old text), Ctrl+V."""
+        with self._lock:
+            try:
+                import evdev  # noqa: F401
+                combo = self._combo_evdev
+            except ImportError:
+                combo = self._combo_ydotool
+            combo("f")
+            time.sleep(0.15)   # let the game open/focus the search box
+            combo("a")
+            time.sleep(0.05)
+            combo("v")
+
+
+GAME_KEYS = GameKeys()
+
+
+def focused_window_is_game():
+    """True/False on niri (via its IPC), None if we can't tell (other
+    compositors) — then we trust the user."""
+    if not shutil.which("niri") or not os.environ.get("NIRI_SOCKET"):
+        return None
+    try:
+        out = subprocess.run(["niri", "msg", "--json", "focused-window"],
+                             capture_output=True, text=True, timeout=2).stdout
+        w = json.loads(out or "null")
+    except Exception:
+        return None
+    if not w:
+        return False
+    app = (w.get("app_id") or "").lower()
+    title = (w.get("title") or "").lower()
+    return "gamescope" in app or "path of exile" in title or "pathofexile" in app
+
+
+LEVEL_RE = re.compile(r'\] : (.+?) \((\w+)\) is now level (\d+)')
+AREA_GEN_RE = re.compile(r'Generating level \d+ area "([^"]+)"')
+
+
+class LogWatcher(FileSystemEventHandler):
+    """Tails PoE Client.txt for zone-change and level-up events."""
+
+    # How far back to look on startup for the last level-up / area.
+    TAIL_SCAN_BYTES = 32 * 1024 * 1024
+
+    def __init__(self, callback, custom_path=None, level_callback=None, character=None):
         self.callback = callback
+        self.level_callback = level_callback
+        self.character = (character or '').strip().lower() or None
+        self._pending_area_id = None
         self.custom_path = Path(custom_path).expanduser() if custom_path else None
         self.client_txt = self._find_client_txt()
         self.last_position = 0
@@ -302,6 +928,36 @@ class LogWatcher(FileSystemEventHandler):
                         return p
         return None
 
+    def _is_our_char(self, name):
+        # Party members' level-ups show up too, so filter if we know the name.
+        return self.character is None or name.strip().lower() == self.character
+
+    def scan_tail(self):
+        """Return (last_level, last_area_id) from the end of Client.txt."""
+        if not self.client_txt or not self.client_txt.exists():
+            return None, None
+        try:
+            size = self.client_txt.stat().st_size
+            with open(self.client_txt, 'rb') as f:
+                f.seek(max(0, size - self.TAIL_SCAN_BYTES))
+                text = f.read().decode('utf-8', errors='ignore')
+        except Exception as e:
+            print(f"Error scanning Client.txt: {e}")
+            return None, None
+        level = area_id = None
+        for line in reversed(text.splitlines()):
+            if level is None and "is now level" in line:
+                m = LEVEL_RE.search(line)
+                if m and self._is_our_char(m.group(1)):
+                    level = int(m.group(3))
+            if area_id is None and "Generating level" in line:
+                m = AREA_GEN_RE.search(line)
+                if m:
+                    area_id = m.group(1)
+            if level is not None and area_id is not None:
+                break
+        return level, area_id
+
     def on_modified(self, event):
         if self.client_txt and event.src_path == str(self.client_txt):
             self._parse_new_lines()
@@ -315,10 +971,19 @@ class LogWatcher(FileSystemEventHandler):
                 new_lines = f.readlines()
                 self.last_position = f.tell()
                 for line in new_lines:
-                    if "You have entered" in line:
+                    if "Generating level" in line:
+                        m = AREA_GEN_RE.search(line)
+                        if m:
+                            self._pending_area_id = m.group(1)
+                    elif "You have entered" in line:
                         m = re.search(r'You have entered (.+?)\.', line)
                         if m:
-                            self.callback(m.group(1).strip())
+                            self.callback(m.group(1).strip(), self._pending_area_id)
+                            self._pending_area_id = None
+                    elif "is now level" in line and self.level_callback:
+                        m = LEVEL_RE.search(line)
+                        if m and self._is_our_char(m.group(1)):
+                            self.level_callback(int(m.group(3)))
         except Exception as e:
             print(f"Error: {e}")
 
@@ -404,6 +1069,120 @@ scrolledwindow.step-scroll > scrollbar slider {
     min-width: 4px;
     min-height: 12px;
     border-radius: 2px;
+}
+
+.bp-bar {
+    color: #ccc;
+    font-size: 10pt;
+    padding: 3px 10px;
+    background: rgba(20, 20, 20, __OP__);
+    border-bottom: 1px solid #555;
+}
+.bp-bar.ok {
+    color: #2ecc71;
+    border-bottom-color: #2ecc71;
+}
+.bp-bar.warn {
+    color: #f1c40f;
+    border-bottom-color: #f1c40f;
+}
+.bp-bar.bad {
+    color: #e67e22;
+    border-bottom-color: #e67e22;
+}
+.bp-bar.alert {
+    color: #fff;
+    background: rgba(160, 40, 30, __OP__);
+    border-bottom-color: #e74c3c;
+    font-weight: bold;
+}
+
+window.links-window {
+    background: transparent;
+}
+.links-root {
+    background: rgba(14, 14, 14, __OP__);
+    border: 1px solid #1abc9c;
+}
+.links-header {
+    background: rgba(26, 26, 26, __OP__);
+    border-bottom: 1px solid #1abc9c;
+    padding: 4px 8px;
+}
+.links-title {
+    color: #1abc9c;
+    font-weight: bold;
+    font-size: 11px;
+}
+.links-hint {
+    color: #888;
+    font-size: 9pt;
+    padding: 2px 10px;
+}
+.link-group {
+    background: rgba(30, 30, 30, __OP__);
+    border-left: 3px solid #1abc9c;
+    padding: 4px 8px;
+    margin: 3px 8px;
+}
+.link-group-head {
+    color: #d4af37;
+    font-size: 9pt;
+    font-weight: bold;
+}
+.link-gems {
+    color: #ddd;
+    font-size: 10pt;
+}
+
+.tip-bar {
+    color: #f5d76e;
+    font-size: 9pt;
+    padding: 3px 10px;
+    background: rgba(40, 34, 10, __OP__);
+    border-bottom: 1px solid #b7950b;
+}
+label.gem-row {
+    color: #ddd;
+    font-size: 10pt;
+    padding: 1px 2px;
+    border-radius: 2px;
+}
+label.gem-row:hover {
+    background: rgba(255, 255, 255, 0.06);
+}
+.regex-section {
+    color: #d4af37;
+    font-size: 9pt;
+    font-weight: bold;
+    padding: 6px 10px 2px 10px;
+}
+.regex-row {
+    background: rgba(30, 30, 30, __OP__);
+    border-left: 3px solid #d4af37;
+    padding: 3px 6px;
+    margin: 2px 8px;
+}
+.regex-name {
+    color: #ddd;
+    font-size: 9pt;
+}
+.regex-code {
+    color: #9bd;
+    font-family: monospace;
+    font-size: 9pt;
+}
+entry.regex-entry {
+    background: #0a0a0a;
+    color: #ddd;
+    border: 1px solid #555;
+    min-height: 20px;
+    font-size: 9pt;
+}
+.links-cost {
+    color: #ccc;
+    font-size: 9pt;
+    padding: 0 10px 4px 10px;
 }
 
 .gem-panel {
@@ -578,6 +1357,14 @@ class OverlayWindow(Gtk.ApplicationWindow):
 
         self.route_data = RouteData()
         self.current_zone = None
+        self.current_area_id = None
+        self.current_level = None
+        self.pob = None          # parsed PoB skill sets (gem links)
+        self.dismissed_tips = set()
+        self.owned_gems = set()   # lower-cased gem names ticked in the popout
+        self._preview_dismissed = set()
+        self.links_win = None
+        self.regex_win = None
         self.current_step_index = 0
         self.log_watcher = None
         self.observer = None
@@ -645,7 +1432,10 @@ class OverlayWindow(Gtk.ApplicationWindow):
         LayerShell.set_anchor(self, LayerShell.Edge.LEFT, True)
         LayerShell.set_margin(self, LayerShell.Edge.TOP, 100)
         LayerShell.set_margin(self, LayerShell.Edge.LEFT, 100)
-        LayerShell.set_keyboard_mode(self, LayerShell.KeyboardMode.ON_DEMAND)
+        # Never take the keyboard: clicking the overlay must leave the game
+        # focused (needed for "Send", and nicer in general). Dialogs are
+        # separate windows with their own keyboard mode.
+        LayerShell.set_keyboard_mode(self, LayerShell.KeyboardMode.NONE)
 
     def _build_ui(self):
         self.set_default_size(self._fixed_width, self._fixed_height)
@@ -671,7 +1461,7 @@ class OverlayWindow(Gtk.ApplicationWindow):
         header.append(self.title_label)
 
         imp_btn = Gtk.Button(label="⬇")
-        imp_btn.set_tooltip_text("Import from Clipboard")
+        imp_btn.set_tooltip_text("Import from clipboard:\nexile-leveling route JSON, or PoB code / pobb.in link (gem links)")
         imp_btn.add_css_class("icon-btn")
         imp_btn.add_css_class("accent")
         imp_btn.connect("clicked", lambda b: self.import_from_clipboard())
@@ -725,6 +1515,27 @@ class OverlayWindow(Gtk.ApplicationWindow):
         self.content_box.max_height = max(80, self._fixed_height - 110)
         self.content_box.set_vexpand(True)
         self.content_box.set_hexpand(True)
+
+        # Level-breakpoint reminder. Lives inside the capped content box so
+        # it takes space from the step text instead of growing the window.
+        self.bp_label = Gtk.Label()
+        self.bp_label.add_css_class("bp-bar")
+        self.bp_label.set_xalign(0)
+        self.bp_label.set_ellipsize(Pango.EllipsizeMode.END)
+        self.bp_label.set_visible(False)
+        self.content_box.append(self.bp_label)
+
+        # Level/area tips (recipes, socket thresholds, Kitava…). Click = dismiss.
+        self.tip_label = Gtk.Label()
+        self.tip_label.add_css_class("tip-bar")
+        self.tip_label.set_xalign(0)
+        self.tip_label.set_ellipsize(Pango.EllipsizeMode.END)
+        self.tip_label.set_visible(False)
+        self.tip_label.set_cursor(Gdk.Cursor.new_from_name("pointer"))
+        tip_click = Gtk.GestureClick.new()
+        tip_click.connect("released", lambda *a: self._dismiss_tip())
+        self.tip_label.add_controller(tip_click)
+        self.content_box.append(self.tip_label)
 
         self.step_label = Gtk.Label(label="Import route to begin")
         self.step_label.add_css_class("step-label")
@@ -781,6 +1592,18 @@ class OverlayWindow(Gtk.ApplicationWindow):
         self.gem_btn.add_css_class("gem-toggle")
         self.gem_btn.connect("clicked", lambda b: self.toggle_gem_panel())
         nav.append(self.gem_btn)
+
+        self.links_btn = Gtk.Button(label="🔗")
+        self.links_btn.set_tooltip_text("Gem links (from PoB) — import a PoB code via ⬇")
+        self.links_btn.add_css_class("gem-toggle")
+        self.links_btn.connect("clicked", lambda b: self.toggle_links_window())
+        nav.append(self.links_btn)
+
+        regex_btn = Gtk.Button(label="🔍")
+        regex_btn.set_tooltip_text("Search regex for vendors/stash (poe.re) — copies into the game, gamescope too")
+        regex_btn.add_css_class("gem-toggle")
+        regex_btn.connect("clicked", lambda b: self.toggle_regex_window())
+        nav.append(regex_btn)
 
         next_btn = Gtk.Button(label="►")
         next_btn.set_tooltip_text("Next step")
@@ -939,24 +1762,195 @@ class OverlayWindow(Gtk.ApplicationWindow):
                 print(f"Error stopping watcher: {e}")
             self.observer = None
         custom = self.config.get('client_txt_path')
-        self.log_watcher = LogWatcher(self._on_zone_signal, custom)
+        self.log_watcher = LogWatcher(self._on_zone_signal, custom,
+                                      level_callback=self._on_level_signal,
+                                      character=self.config.get('character_name'))
+        level, area_id = self.log_watcher.scan_tail()
+        if PREVIEW_LEVEL is not None:
+            level = PREVIEW_LEVEL
+            print(f"Preview mode: pretending to be level {level}")
+        if level is not None:
+            self.current_level = level
+        if area_id is not None:
+            self.current_area_id = area_id
+        if level is not None or area_id is not None:
+            print(f"Client.txt snapshot: level={level}, area={area_id}")
+        if hasattr(self, 'bp_label'):
+            self._refresh_zone_label()
+            self._update_breakpoint_bar()
+            self._update_tip_bar()
         if self.log_watcher.client_txt:
             self.observer = Observer()
             self.observer.schedule(self.log_watcher, str(self.log_watcher.client_txt.parent))
             self.observer.start()
 
-    def _on_zone_signal(self, zone_name):
+    def _on_zone_signal(self, zone_name, area_id=None):
         # watchdog runs in its own thread; marshal back to GTK main loop
-        GLib.idle_add(self._on_zone_change, zone_name)
+        GLib.idle_add(self._on_zone_change, zone_name, area_id)
+
+    def _on_level_signal(self, level):
+        GLib.idle_add(self._on_level_change, level)
+
+    def _on_level_change(self, level):
+        prev_auto = skill_set_for_level(self.pob, self.current_level) if self.pob else None
+        self.current_level = level
+        print(f"Level up: {level}")
+        if self.links_win and self.pob:
+            # Follow the level only if the user is still on the auto-picked set.
+            if self.links_dropdown.get_selected() == prev_auto:
+                self.links_dropdown.set_selected(skill_set_for_level(self.pob, level))
+            self._fill_links_list()
+        self._update_links_badge()
+        self._refresh_zone_label()
+        self._update_breakpoint_bar()
+        self._update_tip_bar()
+        if level < 70:
+            self._flash(f"Lvl {level} — vendors restocked, check for links/upgrades", 6000)
+        return False
+
+    def _refresh_zone_label(self):
+        text = f"Zone: {self.current_zone}" if self.current_zone else "No zone"
+        if self.current_level is not None:
+            text += f"  ·  Lvl {self.current_level}"
+        self.zone_label.set_text(text)
+
+    # ── Tips ─────────────────────────────────────────────────────────
+
+    def _active_tips(self):
+        lvl = self.current_level
+        if lvl is None:
+            return []
+        active = []
+        for tip in TIPS:
+            if tip.get("id") in self.dismissed_tips or tip.get("id") in self._preview_dismissed:
+                continue
+            if tip.get("until") is not None and lvl > tip["until"]:
+                continue
+            if "areas" in tip:
+                if not (self.current_area_id in tip["areas"]):
+                    continue
+                rank = 1000  # area tips are "right now" — show first
+            elif lvl >= tip.get("level", 999):
+                rank = tip["level"]
+            else:
+                continue
+            active.append((rank, tip))
+        active.sort(key=lambda x: -x[0])
+        return [t for _, t in active]
+
+    def _update_tip_bar(self):
+        tips = self._active_tips()
+        if not tips:
+            self.tip_label.set_visible(False)
+            self._shown_tip = None
+            return
+        tip = tips[0]
+        self._shown_tip = tip.get("id")
+        more = f"  (+{len(tips) - 1})" if len(tips) > 1 else ""
+        self.tip_label.set_text(f"💡 {tip['text']}{more}")
+        detail = tip.get("detail", tip["text"])
+        self.tip_label.set_tooltip_text(f"{detail}\n\n(click to dismiss)")
+        self.tip_label.set_visible(True)
+
+    def _dismiss_tip(self):
+        tid = getattr(self, '_shown_tip', None)
+        if not tid:
+            return
+        if PREVIEW_LEVEL is not None:
+            # Preview only — don't hide the tip for when you really get there.
+            self._preview_dismissed.add(tid)
+            self._update_tip_bar()
+            return
+        self.dismissed_tips.add(tid)
+        self._update_tip_bar()
+        self.save_progress()
+
+    # ── Level breakpoints ────────────────────────────────────────────
+
+    @staticmethod
+    def _bp_state(level, target):
+        if level is None:
+            return "unknown"
+        if level >= target:
+            return "ok"
+        return "warn" if target - level <= 1 else "bad"
+
+    def _bp_in_current_area(self, bp):
+        areas = bp.get("areas", [])
+        if self.current_area_id:
+            return self.current_area_id in areas
+        # No "Generating level" line seen — fall back to the zone name.
+        # (Same names exist in Act 6–10, but you're over-leveled there, so
+        # the level check keeps it quiet.)
+        return any(AREA_DATA.get(a, {}).get("name") == self.current_zone for a in areas)
+
+    def _next_breakpoint(self):
+        anchors = self.route_data.bp_anchors if self.route_data.all_steps else {}
+        if anchors:
+            upcoming = [(anchors[bp['id']], bp) for bp in BREAKPOINTS
+                        if bp.get('id') in anchors and anchors[bp['id']] >= self.current_step_index]
+            return min(upcoming, key=lambda x: x[0])[1] if upcoming else None
+        # No route: first breakpoint we haven't hit yet level-wise.
+        for bp in BREAKPOINTS:
+            if self.current_level is None or self.current_level < bp['level']:
+                return bp
+        return None
+
+    def _update_breakpoint_bar(self):
+        if not BREAKPOINTS:
+            self.bp_label.set_visible(False)
+            return
+        lvl = self.current_level
+
+        # 1) Standing in a breakpoint area while under-leveled → loud warning.
+        alert = None
+        if lvl is not None:
+            for bp in BREAKPOINTS:
+                if lvl < bp['level'] and self._bp_in_current_area(bp):
+                    alert = bp
+                    break
+
+        bp = alert or self._next_breakpoint()
+        for cls in ("ok", "warn", "bad", "alert"):
+            self.bp_label.remove_css_class(cls)
+        if bp is None:
+            self.bp_label.set_visible(False)
+            return
+
+        target = bp['level']
+        state = self._bp_state(lvl, target)
+        tgt = fmt_level(target)
+        if alert:
+            self.bp_label.add_css_class("alert")
+            text = f"⚠ Under-leveled: {lvl} / {tgt} for {bp['label']} — farm a bit"
+        elif state == "unknown":
+            text = f"🎯 Lvl {tgt} @ {bp['label']}"
+        elif state == "ok":
+            self.bp_label.add_css_class("ok")
+            text = f"✓ Lvl {tgt} @ {bp['label']}  ·  you: {lvl}"
+        else:
+            self.bp_label.add_css_class(state)
+            diff = target - lvl
+            text = f"🎯 Lvl {tgt} @ {bp['label']}  ·  you: {lvl} (−{fmt_level(diff)})"
+        self.bp_label.set_text(text)
+
+        # Tooltip: full checklist.
+        rows = []
+        for b in BREAKPOINTS:
+            mark = {"ok": "✓", "unknown": "·"}.get(self._bp_state(lvl, b['level']), "✗")
+            rows.append(f"{mark}  {fmt_level(b['level']):>3}  {b['label']}")
+        self.bp_label.set_tooltip_text("Level breakpoints\n" + "\n".join(rows))
+        self.bp_label.set_visible(True)
 
     # Max forward jump for auto-progression. Larger jumps are treated as a
     # later-act revisit (e.g. Act 6 Mud Flats vs Act 1) and skipped — manual
     # jump via the counter is still available.
     AUTO_JUMP_MAX_DISTANCE = 100
 
-    def _on_zone_change(self, zone_name):
+    def _on_zone_change(self, zone_name, area_id=None):
         self.current_zone = zone_name
-        self.zone_label.set_text(f"Zone: {zone_name}")
+        self.current_area_id = area_id
+        self._refresh_zone_label()
 
         all_steps = self.route_data.all_steps
         if not all_steps:
@@ -998,6 +1992,8 @@ class OverlayWindow(Gtk.ApplicationWindow):
             self._current_step_markup = ""
             self.step_label.set_text("No route loaded")
             self.counter.set_label("0/0")
+            self._update_breakpoint_bar()
+            self._update_tip_bar()
             return
         total = len(self.route_data.all_steps)
         self.current_step_index = max(0, min(self.current_step_index, total - 1))
@@ -1008,6 +2004,9 @@ class OverlayWindow(Gtk.ApplicationWindow):
         self.step_label.set_markup(self._current_step_markup)
         self.counter.set_label(f"{self.current_step_index + 1}/{total}")
         self._update_gem_panel()
+        self._update_links_badge()
+        self._update_breakpoint_bar()
+        self._update_tip_bar()
         self._schedule_step_fit()
 
     def _schedule_step_fit(self, *args):
@@ -1129,11 +2128,701 @@ class OverlayWindow(Gtk.ApplicationWindow):
         except Exception as e:
             print(f"Clipboard error: {e}")
             return
-        if text and self.route_data.load_from_json(text):
-            self.current_step_index = 0
-            self.update_display()
-            self.save_progress()
-            print(f"Route imported and saved ({len(self.route_data.all_steps)} steps)")
+        if not text:
+            return
+        stripped = text.strip()
+        if stripped[:1] in ('[', '{', '"'):
+            if self.route_data.load_from_json(text):
+                self.current_step_index = 0
+                self.update_display()
+                self.save_progress()
+                self._flash(f"Route imported ({len(self.route_data.all_steps)} steps)")
+                print(f"Route imported and saved ({len(self.route_data.all_steps)} steps)")
+            else:
+                self._flash("Clipboard JSON is not an exile-leveling route")
+            return
+        url = pob_raw_url(stripped)
+        if url:
+            self._flash("Fetching PoB…")
+            threading.Thread(target=self._fetch_pob_thread, args=(url,), daemon=True).start()
+        else:
+            self._import_pob_code(stripped)
+
+    def _fetch_pob_thread(self, url):
+        try:
+            code = fetch_pob_code(url)
+        except Exception as e:
+            GLib.idle_add(self._flash, f"PoB fetch failed: {e}")
+            return
+        GLib.idle_add(self._import_pob_code, code)
+
+    def _import_pob_code(self, code):
+        try:
+            pob = parse_pob_skills(decode_pob_code(code))
+        except ValueError as e:
+            self._flash("Clipboard is neither a route nor a PoB code")
+            print(f"PoB import: {e}")
+            return False
+        if not any(st["groups"] for st in pob["sets"]):
+            self._flash("PoB has no skill gems")
+            return False
+        self.pob = pob
+        self.save_progress()
+        n = len(pob["sets"])
+        self._flash(f"PoB imported: {n} skill set{'s' if n != 1 else ''} — click 🔗")
+        print(f"PoB imported: {[st['title'] for st in pob['sets']]}")
+        self._update_links_badge()
+        if self.links_win:
+            self._rebuild_links_window()
+        return False
+
+    def _flash(self, msg, ms=3500):
+        """Show a short message in the zone label, then restore it."""
+        self.zone_label.set_text(msg)
+        token = object()
+        self._flash_token = token
+
+        def restore():
+            if getattr(self, '_flash_token', None) is token:
+                self._refresh_zone_label()
+            return False
+        GLib.timeout_add(ms, restore)
+        return False
+
+    # ── Gem links popout ─────────────────────────────────────────────
+
+    # ── Regex popout ─────────────────────────────────────────────────
+
+    def toggle_regex_window(self):
+        if self.regex_win:
+            win, self.regex_win = self.regex_win, None
+            win.destroy()
+            return
+        win = Gtk.Window()
+        win.add_css_class("links-window")
+        LayerShell.init_for_window(win)
+        LayerShell.set_layer(win, LayerShell.Layer.OVERLAY)
+        LayerShell.set_namespace(win, "tuxonthebeach-regex")
+        # Keyboard only while renaming an entry — never steal the game's.
+        LayerShell.set_keyboard_mode(win, LayerShell.KeyboardMode.NONE)
+        LayerShell.set_anchor(win, LayerShell.Edge.TOP, True)
+        LayerShell.set_anchor(win, LayerShell.Edge.LEFT, True)
+        out_w, _ = self._get_output_size()
+        left = LayerShell.get_margin(self, LayerShell.Edge.LEFT)
+        top = LayerShell.get_margin(self, LayerShell.Edge.TOP)
+        width = 360
+        x = left + self._fixed_width + 6
+        if self.links_win:
+            x += 336  # don't cover the gem-links popout
+        if x + width > out_w:
+            x = max(0, left - width - 6)
+        LayerShell.set_margin(win, LayerShell.Edge.LEFT, x)
+        LayerShell.set_margin(win, LayerShell.Edge.TOP, top)
+        win.set_default_size(width, -1)
+
+        root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        root.add_css_class("links-root")
+        win.set_child(root)
+
+        head = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        head.add_css_class("links-header")
+        title = Gtk.Label(label="SEARCH REGEX")
+        title.add_css_class("links-title")
+        title.set_xalign(0)
+        title.set_hexpand(True)
+        head.append(title)
+        close = Gtk.Button(label="✕")
+        close.add_css_class("icon-btn")
+        close.add_css_class("danger")
+        close.connect("clicked", lambda b: self.toggle_regex_window())
+        head.append(close)
+        drag = Gtk.GestureDrag.new()
+        drag.connect("drag-begin", lambda g, x0, y0: setattr(
+            self, '_regex_drag', (LayerShell.get_margin(win, LayerShell.Edge.LEFT),
+                                  LayerShell.get_margin(win, LayerShell.Edge.TOP))))
+        drag.connect("drag-update", lambda g, dx, dy: (
+            LayerShell.set_margin(win, LayerShell.Edge.LEFT, max(0, self._regex_drag[0] + int(dx))),
+            LayerShell.set_margin(win, LayerShell.Edge.TOP, max(0, self._regex_drag[1] + int(dy)))))
+        head.add_controller(drag)
+        root.append(head)
+
+        self.regex_status = Gtk.Label()
+        self.regex_status.add_css_class("links-hint")
+        self.regex_status.set_xalign(0)
+        self.regex_status.set_wrap(True)
+        root.append(self.regex_status)
+
+        scroll = Gtk.ScrolledWindow()
+        scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        scroll.set_propagate_natural_height(True)
+        scroll.set_max_content_height(560)
+        self.regex_list = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        self.regex_list.set_margin_bottom(6)
+        scroll.set_child(self.regex_list)
+        root.append(scroll)
+
+        self.regex_win = win
+        GAME_KEYS.warm_up()
+        self._fill_regex_list()
+        self._set_regex_status()
+        win.present()
+
+        if load_poere_tokens() is None and not getattr(self, '_poere_fetching', False):
+            self._poere_fetching = True
+            threading.Thread(target=self._fetch_poere_thread, daemon=True).start()
+
+    def _fetch_poere_thread(self):
+        try:
+            fetch_poere_tokens()
+            ok = load_poere_tokens() is not None
+        except Exception as e:
+            print(f"poe.re gem tokens: {e}")
+            ok = False
+
+        def done():
+            self._poere_fetching = False
+            if ok and self.regex_win:
+                self._fill_regex_list()
+            self._set_regex_status("Loaded poe.re gem tokens" if ok
+                                   else "poe.re offline — using built-in gem tokens")
+            return False
+        GLib.idle_add(done)
+
+    def _set_regex_status(self, msg=None):
+        if not self.regex_win:
+            return
+        gs = gamescope_displays()
+        where = f"desktop + gamescope {', '.join(gs)}" if gs else "desktop (no gamescope running)"
+        base = f"▶ Send: clipboard ({where}) + Ctrl+F, Ctrl+A, Ctrl+V into the game."
+        self.regex_status.set_text(f"{msg}\n{base}" if msg else base)
+
+    def _vendor_cfg(self):
+        return self.config.setdefault("vendor_builder", {"links": "auto", "ms": True})
+
+    def _vendor_set(self, key, value):
+        self._vendor_cfg()[key] = value
+        save_config(self.config)
+        # Rebuild after the click has finished processing.
+        GLib.idle_add(lambda: (self._fill_regex_list(), False)[1])
+
+    def _vendor_builder(self):
+        cfg = self._vendor_cfg()
+        auto = links_for_level(self.current_level)
+        choice = cfg.get("links", "auto")
+        links = auto if choice == "auto" else int(choice)
+
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3)
+        box.add_css_class("regex-row")
+
+        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=2)
+        lbl = Gtk.Label(label="Links ≥")
+        lbl.add_css_class("regex-name")
+        lbl.set_margin_end(4)
+        row.append(lbl)
+        for value, text in (("auto", f"auto {auto}+"), (0, "off"), (3, "3+"), (4, "4+"), (5, "5+"), (6, "6")):
+            b = Gtk.Button(label=text)
+            b.add_css_class("icon-btn")
+            if str(choice) == str(value):
+                b.add_css_class("accent")
+            if value == "auto":
+                b.set_tooltip_text("Follows your level: 3+ below 25, 4+ from 25, 5+ from 35, 6 from 50\n"
+                                   "(item-level socket limits)")
+            b.connect("clicked", lambda _b, v=value: self._vendor_set("links", v))
+            row.append(b)
+        box.append(row)
+
+        extras = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=2)
+        lbl2 = Gtk.Label(label="or")
+        lbl2.add_css_class("regex-name")
+        lbl2.set_margin_end(4)
+        extras.append(lbl2)
+        for key, label, _pat in VENDOR_EXTRAS:
+            b = Gtk.Button(label=("✓ " if cfg.get(key) else "") + label)
+            b.add_css_class("icon-btn")
+            if cfg.get(key):
+                b.add_css_class("accent")
+            b.connect("clicked", lambda _b, k=key: self._vendor_set(k, not self._vendor_cfg().get(k)))
+            extras.append(b)
+        box.append(extras)
+        self.regex_list.append(box)
+
+        rx = combine_vendor_regex(links, cfg)
+        if rx:
+            desc = [f"≥{links}-link" if links else None] + \
+                   [label for key, label, _p in VENDOR_EXTRAS if cfg.get(key)]
+            self._regex_row("Vendor: " + " or ".join(d for d in desc if d), rx)
+
+    def _regex_section(self, text):
+        lbl = Gtk.Label(label=text)
+        lbl.add_css_class("regex-section")
+        lbl.set_xalign(0)
+        self.regex_list.append(lbl)
+
+    def _regex_row(self, name, regex, on_delete=None, editable_name=None):
+        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        row.add_css_class("regex-row")
+        col = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        col.set_hexpand(True)
+        if editable_name is not None:
+            ent = Gtk.Entry()
+            ent.add_css_class("regex-entry")
+            ent.set_text(name)
+            ent.connect("changed", lambda e: editable_name(e.get_text()))
+            # Popout has no keyboard by default; take it while renaming.
+            grab = Gtk.GestureClick.new()
+            grab.connect("pressed", lambda *a: self._regex_keyboard(True))
+            ent.add_controller(grab)
+            ent.connect("activate", lambda e: self._regex_keyboard(False))
+            col.append(ent)
+        else:
+            nl = Gtk.Label(label=name)
+            nl.add_css_class("regex-name")
+            nl.set_xalign(0)
+            nl.set_ellipsize(Pango.EllipsizeMode.END)
+            col.append(nl)
+        regex = poe_quote(regex)
+        too_long = len(regex) > REGEX_MAX_LEN
+        cl = Gtk.Label()
+        cl.set_markup(f'{esc(regex)}  <span color="{"#e74c3c" if too_long else "#666"}">'
+                      f'{len(regex)}/{REGEX_MAX_LEN}</span>')
+        cl.add_css_class("regex-code")
+        cl.set_xalign(0)
+        cl.set_ellipsize(Pango.EllipsizeMode.END)
+        cl.set_tooltip_text(regex)
+        col.append(cl)
+        row.append(col)
+        regex = poe_quote(regex)
+        btn = Gtk.Button(label="▶ Send")
+        btn.set_tooltip_text("Into the game: Ctrl+F, then paste the regex.\n"
+                             "Click with the game in the background — the overlay doesn't take its focus.")
+        btn.add_css_class("icon-btn")
+        btn.add_css_class("accent")
+        btn.set_valign(Gtk.Align.CENTER)
+        btn.connect("clicked", lambda b, r=regex, n=name: self._send_regex(n, r))
+        row.append(btn)
+        if on_delete:
+            d = Gtk.Button(label="✕")
+            d.add_css_class("icon-btn")
+            d.add_css_class("danger")
+            d.set_valign(Gtk.Align.CENTER)
+            d.connect("clicked", lambda b: on_delete())
+            row.append(d)
+        self.regex_list.append(row)
+
+    def _fill_regex_list(self):
+        child = self.regex_list.get_first_child()
+        while child:
+            nxt = child.get_next_sibling()
+            self.regex_list.remove(child)
+            child = nxt
+
+        # 1) Missing gems of the current PoB set — what to look for at vendors.
+        if self.pob and self.pob.get("sets"):
+            idx = skill_set_for_level(self.pob, self.current_level)
+            if self.links_win:
+                idx = self.links_dropdown.get_selected()
+            title = self.pob["sets"][idx]["title"]
+            names, kinds = [], []
+            for grp in self.pob["sets"][idx]["groups"]:
+                for g in grp["gems"]:
+                    if g["enabled"] and g["name"].lower() not in self.owned_gems and g["name"] not in names:
+                        names.append(g["name"])
+                        kinds.append((g["name"], g["support"]))
+            self._regex_section(f"Missing gems · set \"{title}\"")
+            if names:
+                chunks = build_gem_regex(kinds)
+                for i, rx in enumerate(chunks):
+                    part = f" (part {i + 1}/{len(chunks)})" if len(chunks) > 1 else ""
+                    self._regex_row(f"{len(names)} gems: {', '.join(names)}{part}", rx)
+            else:
+                lbl = Gtk.Label(label="  all gems of this set ticked ✓")
+                lbl.add_css_class("links-hint")
+                lbl.set_xalign(0)
+                self.regex_list.append(lbl)
+
+        # 2) Vendor builder (poe.re patterns), all OR'ed into one search.
+        self._regex_section("Vendor (poe.re)")
+        self._vendor_builder()
+
+        # 3) User's own — e.g. copied from poe.re in the browser.
+        self._regex_section("My regex")
+        saved = self.config.setdefault("regexes", [])
+        for i, item in enumerate(saved):
+            def rename(text, item=item):
+                item["name"] = text
+                save_config(self.config)
+
+            def delete(i=i):
+                del self.config["regexes"][i]
+                save_config(self.config)
+                self._fill_regex_list()
+            self._regex_row(item.get("name", "Regex"), item.get("regex", ""),
+                            on_delete=delete, editable_name=rename)
+        add = Gtk.Button(label="＋ Add from clipboard (e.g. copied on poe.re)")
+        add.add_css_class("icon-btn")
+        add.set_margin_start(8)
+        add.set_margin_end(8)
+        add.set_margin_top(4)
+        add.connect("clicked", lambda b: self._add_regex_from_clipboard())
+        self.regex_list.append(add)
+
+    def _add_regex_from_clipboard(self):
+        Gdk.Display.get_default().get_clipboard().read_text_async(None, self._on_regex_clip)
+
+    def _on_regex_clip(self, clipboard, result):
+        try:
+            text = (clipboard.read_text_finish(result) or "").strip()
+        except Exception as e:
+            print(f"Clipboard error: {e}")
+            text = ""
+        if not text or "\n" in text or len(text) > 1000:
+            self._set_regex_status("Clipboard has no single-line regex")
+            return
+        saved = self.config.setdefault("regexes", [])
+        saved.append({"name": f"Regex {len(saved) + 1}", "regex": poe_quote(text)})
+        save_config(self.config)
+        self._fill_regex_list()
+        self._set_regex_status("Added — click the name to rename it")
+
+    def _regex_keyboard(self, on):
+        if self.regex_win:
+            LayerShell.set_keyboard_mode(
+                self.regex_win,
+                LayerShell.KeyboardMode.ON_DEMAND if on else LayerShell.KeyboardMode.NONE)
+
+    def _release_keyboard(self):
+        """Make sure none of our surfaces holds the keyboard, so the
+        compositor hands it back to the game."""
+        self._regex_keyboard(False)
+        if self.links_win:
+            LayerShell.set_keyboard_mode(self.links_win, LayerShell.KeyboardMode.NONE)
+
+    def _send_regex(self, name, regex):
+        regex = poe_quote(regex)
+        reached, problems = copy_text_everywhere(regex)
+        self._release_keyboard()
+        warn = f" · ⚠ {len(regex)} chars, PoE cuts at {REGEX_MAX_LEN}" if len(regex) > REGEX_MAX_LEN else ""
+        if not GAME_KEYS.available():
+            self._regex_done(f"Copied “{name[:30]}” — no uinput/ydotool, press Ctrl+F, Ctrl+V yourself"
+                             + warn, problems)
+            return
+        threading.Thread(target=self._send_thread, args=(name, warn, problems), daemon=True).start()
+
+    def _send_thread(self, name, warn, problems):
+        time.sleep(0.2)  # compositor moves keyboard focus back to the game
+        game = focused_window_is_game()
+        if game is False:
+            GLib.idle_add(self._regex_done,
+                          f"Copied “{name[:30]}” — game window not focused, nothing typed. "
+                          "Click into the game, Ctrl+F, Ctrl+V" + warn, problems)
+            return
+        try:
+            GAME_KEYS.search_and_paste()
+            msg = f"Sent “{name[:30]}” → Ctrl+F, Ctrl+V" + warn
+        except Exception as e:
+            msg = f"Copied “{name[:30]}”, sending keys failed ({e}) — Ctrl+F, Ctrl+V yourself" + warn
+        GLib.idle_add(self._regex_done, msg, problems)
+
+    def _regex_done(self, msg, problems):
+        if problems:
+            msg += " · " + "; ".join(problems)
+        print(msg)
+        self._set_regex_status(msg)
+        self._flash(msg)
+        if self.links_win:
+            LayerShell.set_keyboard_mode(self.links_win, LayerShell.KeyboardMode.ON_DEMAND)
+        return False
+
+    def _close_links_window(self):
+        win, self.links_win = self.links_win, None
+        if win:
+            win.destroy()
+
+    def toggle_links_window(self):
+        if self.links_win:
+            self._close_links_window()
+            return
+        if not self.pob:
+            self._flash("No PoB yet — copy PoB code/link, then ⬇")
+            return
+
+        win = Gtk.Window()
+        win.add_css_class("links-window")
+        LayerShell.init_for_window(win)
+        LayerShell.set_layer(win, LayerShell.Layer.OVERLAY)
+        LayerShell.set_namespace(win, "tuxonthebeach-links")
+        LayerShell.set_keyboard_mode(win, LayerShell.KeyboardMode.ON_DEMAND)
+        LayerShell.set_anchor(win, LayerShell.Edge.TOP, True)
+        LayerShell.set_anchor(win, LayerShell.Edge.LEFT, True)
+
+        # Open beside the overlay: right if there's room, else left.
+        out_w, _ = self._get_output_size()
+        left = LayerShell.get_margin(self, LayerShell.Edge.LEFT)
+        top = LayerShell.get_margin(self, LayerShell.Edge.TOP)
+        width = 330
+        x = left + self._fixed_width + 6
+        if x + width > out_w:
+            x = max(0, left - width - 6)
+        LayerShell.set_margin(win, LayerShell.Edge.LEFT, x)
+        LayerShell.set_margin(win, LayerShell.Edge.TOP, top)
+        win.set_default_size(width, -1)
+
+        root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        root.add_css_class("links-root")
+        win.set_child(root)
+
+        head = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        head.add_css_class("links-header")
+        title = Gtk.Label(label="GEM LINKS")
+        title.add_css_class("links-title")
+        title.set_xalign(0)
+        title.set_hexpand(True)
+        head.append(title)
+
+        titles = [st["title"] for st in self.pob["sets"]]
+        self.links_dropdown = Gtk.DropDown.new_from_strings(titles)
+        self.links_dropdown.set_selected(skill_set_for_level(self.pob, self.current_level))
+        self.links_dropdown.connect("notify::selected", lambda *a: self._fill_links_list())
+        self.links_dropdown.set_visible(len(titles) > 1)
+        head.append(self.links_dropdown)
+
+        close = Gtk.Button(label="✕")
+        close.add_css_class("icon-btn")
+        close.add_css_class("danger")
+        close.connect("clicked", lambda b: self._close_links_window())
+        head.append(close)
+
+        drag = Gtk.GestureDrag.new()
+        drag.connect("drag-begin", lambda g, x0, y0: setattr(
+            self, '_links_drag', (LayerShell.get_margin(win, LayerShell.Edge.LEFT),
+                                  LayerShell.get_margin(win, LayerShell.Edge.TOP))))
+        drag.connect("drag-update", lambda g, dx, dy: (
+            LayerShell.set_margin(win, LayerShell.Edge.LEFT, max(0, self._links_drag[0] + int(dx))),
+            LayerShell.set_margin(win, LayerShell.Edge.TOP, max(0, self._links_drag[1] + int(dy)))))
+        head.add_controller(drag)
+        root.append(head)
+
+        self.links_hint = Gtk.Label()
+        self.links_hint.add_css_class("links-hint")
+        self.links_hint.set_xalign(0)
+        root.append(self.links_hint)
+
+        cost_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        self.links_cost = Gtk.Label()
+        self.links_cost.add_css_class("links-cost")
+        self.links_cost.set_xalign(0)
+        self.links_cost.set_wrap(True)
+        self.links_cost.set_hexpand(True)
+        cost_row.append(self.links_cost)
+        self.links_all_btn = Gtk.Button(label="✓ all")
+        self.links_all_btn.add_css_class("icon-btn")
+        self.links_all_btn.set_valign(Gtk.Align.START)
+        self.links_all_btn.set_margin_end(8)
+        self.links_all_btn.connect("clicked", lambda b: self._toggle_set_owned())
+        cost_row.append(self.links_all_btn)
+        root.append(cost_row)
+
+        scroll = Gtk.ScrolledWindow()
+        scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        scroll.set_propagate_natural_height(True)
+        scroll.set_max_content_height(560)
+        self.links_list = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        self.links_list.set_margin_bottom(6)
+        scroll.set_child(self.links_list)
+        root.append(scroll)
+
+        self.links_win = win
+        self._fill_links_list()
+        win.present()
+
+    def _make_gem_row(self, gem):
+        key = gem["name"].lower()
+        owned = key in self.owned_gems
+        icon = "⬡" if gem["support"] else "💎"
+        indent = "   " if gem["support"] else ""
+        mark = '<span color="#2ecc71">✓</span>' if owned else '<span color="#e67e22">○</span>'
+        if owned or not gem["enabled"]:
+            name = f'<span color="#777">{icon} {esc(gem["name"])}</span>'
+        elif gem["support"]:
+            name = f'<span color="#3498db">{icon} {esc(gem["name"])}</span>'
+        else:
+            name = f'<span color="#1abc9c" weight="bold">{icon} {esc(gem["name"])}</span>'
+        txt = f"{indent}{mark} {name}"
+        info = gem_info(gem.get("gem_id"), gem["name"])
+        quest_free = bool(info and info.get("id") in self.route_data.quest_gems)
+        if not owned:
+            if quest_free:
+                txt += '  <span color="#f39c12"><small>quest</small></span>'
+            else:
+                price = gem_cost_markup(gem.get("gem_id"), gem["name"])
+                if price:
+                    txt += f"  {price}"
+        if not gem["enabled"]:
+            txt = f'<span strikethrough="true">{txt}</span>'
+
+        lbl = Gtk.Label()
+        lbl.set_markup(txt)
+        lbl.add_css_class("gem-row")
+        lbl.set_xalign(0)
+        lbl.set_ellipsize(Pango.EllipsizeMode.END)
+        lbl.set_cursor(Gdk.Cursor.new_from_name("pointer"))
+        tip = []
+        if quest_free:
+            tip.append("Quest reward in your route")
+        if info:
+            tip.append(gem_where_text(info.get("id"), self.pob.get("class") or None))
+        tip.append("Click: " + ("mark as missing" if owned else "mark as owned"))
+        lbl.set_tooltip_text("\n".join(tip))
+        click = Gtk.GestureClick.new()
+        click.connect("released", lambda *a, k=key: self._toggle_gem_owned(k))
+        lbl.add_controller(click)
+        return lbl
+
+    def _toggle_gem_owned(self, key):
+        if key in self.owned_gems:
+            self.owned_gems.discard(key)
+        else:
+            self.owned_gems.add(key)
+        self._after_owned_change()
+
+    def _set_gem_keys(self, idx):
+        keys = []
+        for grp in self.pob["sets"][idx]["groups"]:
+            for g in grp["gems"]:
+                k = g["name"].lower()
+                if g["enabled"] and k not in keys:
+                    keys.append(k)
+        return keys
+
+    def _toggle_set_owned(self):
+        idx = self.links_dropdown.get_selected()
+        keys = self._set_gem_keys(idx)
+        if all(k in self.owned_gems for k in keys):
+            self.owned_gems.difference_update(keys)
+        else:
+            self.owned_gems.update(keys)
+        self._after_owned_change()
+
+    def _after_owned_change(self):
+        if self.regex_win:
+            self._fill_regex_list()
+        self._fill_links_list()
+        self._update_links_badge()
+        self.save_progress()
+
+    def _missing_in_set(self, idx):
+        return [k for k in self._set_gem_keys(idx) if k not in self.owned_gems]
+
+    def _update_links_badge(self):
+        if not self.pob or not self.pob.get("sets"):
+            self.links_btn.set_label("🔗")
+            return
+        idx = skill_set_for_level(self.pob, self.current_level)
+        missing = len(self._missing_in_set(idx))
+        self.links_btn.set_label(f"🔗 {missing}" if missing else "🔗 ✓")
+        self.links_btn.set_tooltip_text(
+            f"Gem links — set \"{self.pob['sets'][idx]['title']}\": "
+            + (f"{missing} gem(s) still missing" if missing else "all gems owned"))
+
+    def _set_cost(self, idx):
+        """Vendor cost of the gems in skill set `idx` you haven't ticked as
+        owned. Quest rewards from your route are listed as free.
+        Returns ({tier: count}, [free names], unknown count)."""
+        sets = self.pob["sets"]
+        quest = self.route_data.quest_gems
+        totals, free, unknown, seen = {}, [], 0, set()
+        for grp in sets[idx]["groups"]:
+            for g in grp["gems"]:
+                key = g["name"].lower()
+                if not g["enabled"] or key in self.owned_gems:
+                    continue
+                # Same gem in two groups = two copies to buy. A quest
+                # reward only covers the first one.
+                first = key not in seen
+                seen.add(key)
+                info = gem_info(g.get("gem_id"), g["name"])
+                if first and info and info.get("id") in quest:
+                    free.append(g["name"])
+                    continue
+                cost = gem_cost(g.get("gem_id"), g["name"])
+                if cost:
+                    totals[cost] = totals.get(cost, 0) + 1
+                else:
+                    unknown += 1
+        return totals, free, unknown
+
+    def _fill_links_cost(self, idx):
+        totals, free, unknown = self._set_cost(idx)
+        order = {label: i for i, (_, label, _) in enumerate(GEM_COST_TIERS)}
+        parts = [f'<span color="{color}">{n}× {esc(label)}</span>'
+                 for (label, color), n in sorted(totals.items(), key=lambda x: order[x[0][0]])]
+        all_owned = not self._missing_in_set(idx)
+        self.links_all_btn.set_label("undo ✓" if all_owned else "✓ all")
+        self.links_all_btn.set_tooltip_text(
+            "Mark every gem of this set as missing again" if all_owned
+            else "Bought everything? Mark all gems of this set as owned")
+        if not parts and not free:
+            self.links_cost.set_markup('<span color="#2ecc71">💰 all gems of this set owned ✓</span>')
+        else:
+            txt = "💰 " + ("  ".join(parts) if parts else "nothing to buy")
+            if free:
+                txt += f'  <span color="#f39c12">+{len(free)} from quests</span>'
+            if unknown:
+                txt += f'  <span color="#888">+{unknown} unknown</span>'
+            self.links_cost.set_markup(txt)
+        tip = ("Currency still needed for this set — only gems not ticked ✓.\n"
+               "Couldn't buy one? Leave it open; it stays counted here and in later sets.")
+        if free:
+            tip += "\nQuest rewards per your route (free): " + ", ".join(free)
+        self.links_cost.set_tooltip_text(tip)
+
+    def _rebuild_links_window(self):
+        self._close_links_window()
+        self.toggle_links_window()
+
+    def _fill_links_list(self):
+        if not self.links_win or not self.pob:
+            return
+        child = self.links_list.get_first_child()
+        while child:
+            nxt = child.get_next_sibling()
+            self.links_list.remove(child)
+            child = nxt
+
+        idx = self.links_dropdown.get_selected()
+        sets = self.pob["sets"]
+        if not (0 <= idx < len(sets)):
+            return
+        sset = sets[idx]
+
+        auto = skill_set_for_level(self.pob, self.current_level)
+        build = " ".join(x for x in (self.pob.get("ascendancy") or self.pob.get("class"),) if x)
+        hint = f"{build} · " if build else ""
+        hint += f"set \"{sset['title']}\""
+        if self.current_level is not None and idx == auto:
+            hint += f" (auto for lvl {self.current_level})"
+        self.links_hint.set_text(hint)
+        self._fill_links_cost(idx)
+
+        # Biggest links first — that's what you build around.
+        groups = sorted(sset["groups"], key=lambda g: -len(g["gems"]))
+        for grp in groups:
+            box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=1)
+            box.add_css_class("link-group")
+            n = len(grp["gems"])
+            head = f"{n}L" + (f" · {grp['slot']}" if grp["slot"] else "")
+            if grp["label"]:
+                head += f" · {grp['label']}"
+            hl = Gtk.Label(label=head)
+            hl.add_css_class("link-group-head")
+            hl.set_xalign(0)
+            hl.set_ellipsize(Pango.EllipsizeMode.END)
+            box.append(hl)
+
+            # Actives first, then supports — reads like "skill + its supports".
+            for gem in sorted(grp["gems"], key=lambda g: g["support"]):
+                box.append(self._make_gem_row(gem))
+            self.links_list.append(box)
 
     def show_about(self):
         dialog = Gtk.Window()
@@ -1461,12 +3150,17 @@ class OverlayWindow(Gtk.ApplicationWindow):
         save_config(self.config)
 
         if char_changed:
+            self.current_level = None
             self.progress_file = progress_file_for(new_char)
             if self.progress_file.exists():
                 self.load_progress()
                 print(f"Switched to character '{new_char or 'default'}' — loaded existing progress.")
             else:
                 self.route_data = RouteData()
+                self.pob = None
+                self.dismissed_tips = set()
+                self.owned_gems = set()
+                self._update_links_badge()
                 self.current_step_index = 0
                 self.current_zone = None
                 self.update_display()
@@ -1564,6 +3258,12 @@ class OverlayWindow(Gtk.ApplicationWindow):
                 self.route_data.zone_steps = rd.get('zone_steps', {})
             self.current_step_index = data.get('current_step', 0)
             self.current_zone = data.get('current_zone', 'Unknown')
+            self.pob = data.get('pob')
+            self.dismissed_tips = set(data.get('dismissed_tips', []))
+            self.owned_gems = set(data.get('owned_gems', []))
+            if self.current_level is None:
+                self.current_level = data.get('current_level')
+            self._refresh_zone_label()
             print(f"Restored: Step {self.current_step_index + 1}/{len(self.route_data.all_steps)}, Zone: {self.current_zone}")
             self.update_display()
             return True
@@ -1579,6 +3279,10 @@ class OverlayWindow(Gtk.ApplicationWindow):
                 'route_hash': self.route_data.route_hash,
                 'current_step': self.current_step_index,
                 'current_zone': self.current_zone,
+                'current_level': self.current_level,
+                'pob': self.pob,
+                'dismissed_tips': sorted(self.dismissed_tips),
+                'owned_gems': sorted(self.owned_gems),
                 'route_data': {
                     'acts': self.route_data.acts,
                     'all_steps': self.route_data.all_steps,
@@ -1592,6 +3296,9 @@ class OverlayWindow(Gtk.ApplicationWindow):
             print(f"Error saving progress: {e}")
 
     def _on_close_request(self, window):
+        self._close_links_window()
+        if self.regex_win:
+            self.toggle_regex_window()
         self.save_progress()
         self._save_window_state()
         if self.observer:
@@ -1663,8 +3370,23 @@ def main():
         print("    python3 tuxonthebeach.py")
         sys.exit(1)
 
+    # Our own options — strip them before GApplication sees argv.
+    global PREVIEW_LEVEL
+    argv = list(sys.argv)
+    if "--level" in argv:
+        i = argv.index("--level")
+        try:
+            PREVIEW_LEVEL = int(argv[i + 1])
+        except (IndexError, ValueError):
+            print("usage: tuxonthebeach_gtk.py [--level N]")
+            sys.exit(2)
+        del argv[i:i + 2]
+
     app = TuxApp()
-    app.run(sys.argv)
+    if PREVIEW_LEVEL is not None:
+        # Run beside a normal instance instead of handing off to it.
+        app.set_flags(Gio.ApplicationFlags.NON_UNIQUE)
+    app.run(argv)
 
 
 if __name__ == '__main__':

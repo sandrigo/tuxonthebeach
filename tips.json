@@ -1,0 +1,86 @@
+[
+  {
+    "id": "weapon_recipe",
+    "level": 2,
+    "until": 20,
+    "text": "Weapon recipe: white weapon + Rustic Sash + Whetstone → % phys",
+    "detail": "Vendor: normal weapon + Rustic Sash + Blacksmith's Whetstone → magic weapon with increased physical damage.\nMagic sash → Heavy (40–49%), rare sash → Serrated (50–64%).\nCasters: wand/sceptre/rune dagger/staff + Chain Belt + Whetstone → spell damage."
+  },
+  {
+    "id": "ms_boots",
+    "level": 5,
+    "until": 40,
+    "text": "MS boots: boots + Quicksilver Flask + Augmentation",
+    "detail": "Vendor: boots + any Quicksilver Flask + Orb of Augmentation → movement speed.\nRepeat with the result to raise it one tier per use (up to 30%)."
+  },
+  {
+    "id": "ring_sapphire",
+    "level": 8,
+    "until": 30,
+    "text": "Sapphire Ring usable (cold res): Iron Ring + Fireball",
+    "detail": "Vendor: Iron Ring + Fireball → Sapphire Ring (+20–30% cold res, req. lvl 8)."
+  },
+  {
+    "id": "ring_topaz",
+    "level": 12,
+    "until": 30,
+    "text": "Topaz Ring usable (light res): Iron Ring + Splitting Steel",
+    "detail": "Vendor: Iron Ring + Splitting Steel → Topaz Ring (+20–30% lightning res, req. lvl 12)."
+  },
+  {
+    "id": "ring_ruby",
+    "level": 16,
+    "until": 30,
+    "text": "Ruby Ring usable (fire res): Iron Ring + Heavy Strike",
+    "detail": "Vendor: Iron Ring + Heavy Strike → Ruby Ring (+20–30% fire res, req. lvl 16)."
+  },
+  {
+    "id": "ring_twostone",
+    "level": 20,
+    "until": 40,
+    "text": "Two-Stone Rings usable now (dual res)",
+    "detail": "Two-Stone Ring, req. lvl 20: two resistances at +12–16% each. Watch vendors and drops."
+  },
+  {
+    "id": "sockets_4",
+    "level": 24,
+    "until": 40,
+    "text": "4-socket items from ilvl 25 — check vendors every level-up",
+    "detail": "Item level 25+ can roll 4 sockets (chest, helm, gloves, boots, 2H).\nVendors restock on level-up: look for 4-links, or 4 sockets to fuse."
+  },
+  {
+    "id": "sockets_5",
+    "level": 35,
+    "until": 50,
+    "text": "5-socket items from ilvl 35 (chest / 2H / bow)",
+    "detail": "Item level 35+ can roll 5 sockets on body armour, two-handers and bows. Time to look for a 5-link."
+  },
+  {
+    "id": "chaos_res",
+    "level": 38,
+    "until": 60,
+    "text": "Amethyst Ring usable · chaos res recipe",
+    "detail": "Amethyst Ring, req. lvl 38: +17–23% chaos res.\nVendor: ring/amulet + Amethyst Flask + Orb of Augmentation → chaos res."
+  },
+  {
+    "id": "kitava_a5",
+    "areas": ["2_6_1", "2_6_town"],
+    "until": 60,
+    "text": "Kitava: −30% all res — recap fire/cold/light to 75%",
+    "detail": "Finishing Act 5 permanently lowers all resistances (incl. chaos) by 30%."
+  },
+  {
+    "id": "sockets_6",
+    "level": 50,
+    "until": 68,
+    "text": "6-socket items from ilvl 50",
+    "detail": "Item level 50+ can roll 6 sockets. Vendor a 6-socket item → 7 Jeweller's Orbs; a 6-link → 20 Fusings."
+  },
+  {
+    "id": "kitava_a10",
+    "areas": ["2_11_endgame_town"],
+    "until": 75,
+    "text": "Kitava: another −30% all res (−60% total) — recap",
+    "detail": "Finishing Act 10 lowers all resistances by a further 30% (total −60%)."
+  }
+]
