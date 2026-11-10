@@ -964,6 +964,44 @@ def focused_window_is_game():
 
 LEVEL_RE = re.compile(r'\] : (.+?) \((\w+)\) is now level (\d+)')
 AREA_GEN_RE = re.compile(r'Generating level \d+ area "([^"]+)"')
+AFK_RE = re.compile(r'\] : AFK mode is now (ON|OFF)')
+
+
+def session_event(line):
+    """Ingame state implied by a Client.txt line: True (playing a character),
+    False (game start, logout/char select, AFK) or None (irrelevant)."""
+    if "You have entered" in line:
+        return True
+    if "LOG FILE OPENING" in line:
+        return False
+    if "Async connecting to" in line and "login.pathofexile" in line:
+        # Login server connect = (re)login or back to character select.
+        return False
+    if "AFK mode" in line:
+        m = AFK_RE.search(line)
+        if m:
+            return m.group(1) == "OFF"
+    return None
+
+
+def game_running():
+    """True if a Path of Exile process exists (native or under Proton)."""
+    for d in os.listdir('/proc'):
+        if not d.isdigit():
+            continue
+        try:
+            # Match the process itself (comm / argv[0]), not any command
+            # line that merely mentions the game, e.g. a shell or editor.
+            with open(f'/proc/{d}/comm', 'rb') as f:
+                if f.read().lower().startswith(b'pathofexile'):
+                    return True
+            with open(f'/proc/{d}/cmdline', 'rb') as f:
+                argv0 = f.read().split(b'\0', 1)[0].lower()
+            if b'pathofexile' in argv0 and argv0.endswith(b'.exe'):
+                return True
+        except OSError:
+            pass
+    return False
 
 
 class LogWatcher(FileSystemEventHandler):
@@ -972,9 +1010,11 @@ class LogWatcher(FileSystemEventHandler):
     # How far back to look on startup for the last level-up / area.
     TAIL_SCAN_BYTES = 32 * 1024 * 1024
 
-    def __init__(self, callback, custom_path=None, level_callback=None, character=None):
+    def __init__(self, callback, custom_path=None, level_callback=None, character=None,
+                 session_callback=None):
         self.callback = callback
         self.level_callback = level_callback
+        self.session_callback = session_callback
         self.character = (character or '').strip().lower() or None
         self._pending_area_id = None
         self.custom_path = Path(custom_path).expanduser() if custom_path else None
@@ -1034,9 +1074,9 @@ class LogWatcher(FileSystemEventHandler):
         return self.character is None or name.strip().lower() == self.character
 
     def scan_tail(self):
-        """Return (last_level, last_area_id) from the end of Client.txt."""
+        """Return (last_level, last_area_id, ingame) from the end of Client.txt."""
         if not self.client_txt or not self.client_txt.exists():
-            return None, None
+            return None, None, None
         try:
             size = self.client_txt.stat().st_size
             with open(self.client_txt, 'rb') as f:
@@ -1044,9 +1084,11 @@ class LogWatcher(FileSystemEventHandler):
                 text = f.read().decode('utf-8', errors='ignore')
         except Exception as e:
             print(f"Error scanning Client.txt: {e}")
-            return None, None
-        level = area_id = None
+            return None, None, None
+        level = area_id = ingame = None
         for line in reversed(text.splitlines()):
+            if ingame is None:
+                ingame = session_event(line)
             if level is None and "is now level" in line:
                 m = LEVEL_RE.search(line)
                 if m and self._is_our_char(m.group(1)):
@@ -1055,9 +1097,9 @@ class LogWatcher(FileSystemEventHandler):
                 m = AREA_GEN_RE.search(line)
                 if m:
                     area_id = m.group(1)
-            if level is not None and area_id is not None:
+            if level is not None and area_id is not None and ingame is not None:
                 break
-        return level, area_id
+        return level, area_id, ingame
 
     def on_modified(self, event):
         if self.client_txt and event.src_path == str(self.client_txt):
@@ -1072,6 +1114,10 @@ class LogWatcher(FileSystemEventHandler):
                 new_lines = f.readlines()
                 self.last_position = f.tell()
                 for line in new_lines:
+                    if self.session_callback:
+                        state = session_event(line)
+                        if state is not None:
+                            self.session_callback(state, "You have entered" in line)
                     if "Generating level" in line:
                         m = AREA_GEN_RE.search(line)
                         if m:
@@ -1144,12 +1190,50 @@ button.icon-btn.danger {
     color: #e74c3c;
 }
 
+.zone-row {
+    background: rgba(10, 10, 10, __OP__);
+    border-bottom: 1px solid rgba(34, 34, 34, 0.6);
+}
 .zone-label {
     color: #aaa;
     font-size: 10px;
     padding: 4px 12px;
-    background: rgba(10, 10, 10, __OP__);
-    border-bottom: 1px solid rgba(34, 34, 34, 0.6);
+}
+
+.playtime {
+    margin: 2px 8px 2px 0;
+    padding: 0 7px;
+    border-radius: 9px;
+    border: 1px solid transparent;
+    transition: all 200ms ease;
+}
+.playtime:hover {
+    border-color: rgba(212, 175, 55, 0.5);
+    background: rgba(212, 175, 55, 0.08);
+}
+.pt-time {
+    font-family: monospace;
+    font-feature-settings: "tnum";
+    font-size: 10px;
+    font-weight: bold;
+    letter-spacing: 1px;
+    color: #666;
+}
+.pt-dot {
+    font-size: 7px;
+    color: #444;
+}
+.playtime.running .pt-time { color: #1abc9c; }
+.playtime.running .pt-dot {
+    color: #1abc9c;
+    animation: pt-pulse 2s ease-in-out infinite;
+}
+.playtime.paused .pt-time { color: #d4af37; }
+.playtime.paused .pt-dot { color: #d4af37; }
+@keyframes pt-pulse {
+    0%   { opacity: 1.0; }
+    50%  { opacity: 0.25; }
+    100% { opacity: 1.0; }
 }
 
 .step-label {
@@ -1473,6 +1557,13 @@ class OverlayWindow(Gtk.ApplicationWindow):
         self.gem_visible = True
         self.config = load_config()
         self.progress_file = progress_file_for(self.config.get('character_name'))
+        # Playtime: counts only while a character is ingame (from Client.txt).
+        self._pt_total = 0.0         # accumulated seconds (excl. running span)
+        self._pt_since = None        # monotonic start of the running span
+        self._pt_ingame = False
+        self._pt_manual_pause = False
+        self._pt_ticks = 0
+        self._pt_load()
         self._current_step_markup = ""
         self._last_applied_markup = None
         self._fit_pending = False
@@ -1514,6 +1605,8 @@ class OverlayWindow(Gtk.ApplicationWindow):
         self.connect("realize", lambda w: self._clamp_position())
         self.load_progress()
         self._refresh_status_display()
+        self._pt_refresh()
+        GLib.timeout_add_seconds(1, self._pt_tick)
 
     def _refresh_status_display(self):
         parts = []
@@ -1614,7 +1707,29 @@ class OverlayWindow(Gtk.ApplicationWindow):
         zone_drag.connect("drag-update", self._on_drag_update)
         zone_drag.connect("drag-end", lambda *a: self._save_window_state())
         self.zone_label.add_controller(zone_drag)
-        root.append(self.zone_label)
+        self.zone_label.set_hexpand(True)
+
+        zone_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
+        zone_row.add_css_class("zone-row")
+        zone_row.append(self.zone_label)
+
+        # Mini playtime clock. Left click = pause/resume, right click = reset.
+        self.pt_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=5)
+        self.pt_box.add_css_class("playtime")
+        self.pt_box.set_valign(Gtk.Align.CENTER)
+        self.pt_box.set_cursor(Gdk.Cursor.new_from_name("pointer"))
+        self.pt_dot = Gtk.Label(label="●")
+        self.pt_dot.add_css_class("pt-dot")
+        self.pt_box.append(self.pt_dot)
+        self.pt_label = Gtk.Label(label="0:00:00")
+        self.pt_label.add_css_class("pt-time")
+        self.pt_box.append(self.pt_label)
+        pt_click = Gtk.GestureClick.new()
+        pt_click.set_button(0)
+        pt_click.connect("released", self._on_pt_click)
+        self.pt_box.add_controller(pt_click)
+        zone_row.append(self.pt_box)
+        root.append(zone_row)
 
         # Step + gem share a CappedBox so their combined height is fixed.
         # Toggling the gem panel just shifts space between the two without
@@ -1906,8 +2021,11 @@ class OverlayWindow(Gtk.ApplicationWindow):
         custom = self.config.get('client_txt_path')
         self.log_watcher = LogWatcher(self._on_zone_signal, custom,
                                       level_callback=self._on_level_signal,
-                                      character=self.config.get('character_name'))
-        level, area_id = self.log_watcher.scan_tail()
+                                      character=self.config.get('character_name'),
+                                      session_callback=self._on_session_signal)
+        level, area_id, ingame = self.log_watcher.scan_tail()
+        # Overlay (re)started mid-session: pick up where the log says we are.
+        self._pt_set_ingame(bool(ingame) and game_running())
         if PREVIEW_LEVEL is not None:
             level = PREVIEW_LEVEL
             print(f"Preview mode: pretending to be level {level}")
@@ -1932,6 +2050,9 @@ class OverlayWindow(Gtk.ApplicationWindow):
 
     def _on_level_signal(self, level):
         GLib.idle_add(self._on_level_change, level)
+
+    def _on_session_signal(self, ingame, zone_entered):
+        GLib.idle_add(lambda: self._pt_set_ingame(ingame, zone_entered) and False)
 
     def _on_level_change(self, level):
         prev_auto = skill_set_for_level(self.pob, self.current_level) if self.pob else None
@@ -3539,6 +3660,7 @@ class OverlayWindow(Gtk.ApplicationWindow):
         # Persist current progress to the OLD file before switching profiles.
         if char_changed:
             self.save_progress()
+            self._pt_save()
 
         self.config['client_txt_path'] = path if path else None
         self.config['opacity'] = opacity
@@ -3549,6 +3671,7 @@ class OverlayWindow(Gtk.ApplicationWindow):
         if char_changed:
             self.current_level = None
             self.progress_file = progress_file_for(new_char)
+            self._pt_load()
             if self.progress_file.exists():
                 self.load_progress()
                 print(f"Switched to character '{new_char or 'default'}' — loaded existing progress.")
@@ -3636,6 +3759,129 @@ class OverlayWindow(Gtk.ApplicationWindow):
         print(f"Jumped to step {n}/{total}")
         dialog.destroy()
 
+    # ── Playtime ─────────────────────────────────────────────────────
+
+    def _pt_file(self):
+        return self.progress_file.with_name(
+            self.progress_file.name.replace('progress', 'playtime', 1))
+
+    def _pt_elapsed(self):
+        if self._pt_since is None:
+            return self._pt_total
+        return self._pt_total + time.monotonic() - self._pt_since
+
+    def _pt_load(self):
+        try:
+            with open(self._pt_file()) as f:
+                self._pt_total = float(json.load(f).get('seconds', 0))
+        except (OSError, ValueError, AttributeError):
+            self._pt_total = 0.0
+        if self._pt_since is not None:
+            self._pt_since = time.monotonic()
+        if hasattr(self, 'pt_label'):
+            self._pt_refresh()
+
+    def _pt_save(self):
+        try:
+            with open(self._pt_file(), 'w') as f:
+                json.dump({'seconds': int(self._pt_elapsed())}, f)
+        except OSError as e:
+            print(f"Error saving playtime: {e}")
+
+    def _pt_set_ingame(self, ingame, zone_entered=False):
+        self._pt_ingame = ingame
+        if zone_entered:
+            # Entering a zone means you're back — end a forgotten manual pause.
+            self._pt_manual_pause = False
+        self._pt_apply()
+
+    def _pt_apply(self):
+        run = self._pt_ingame and not self._pt_manual_pause
+        if run and self._pt_since is None:
+            self._pt_since = time.monotonic()
+        elif not run and self._pt_since is not None:
+            self._pt_total = self._pt_elapsed()
+            self._pt_since = None
+            self._pt_save()
+        if hasattr(self, 'pt_label'):
+            self._pt_refresh()
+
+    def _pt_refresh(self):
+        secs = int(self._pt_elapsed())
+        self.pt_label.set_text(f"{secs // 3600}:{secs // 60 % 60:02d}:{secs % 60:02d}")
+        for c in ("running", "paused"):
+            self.pt_box.remove_css_class(c)
+        if self._pt_since is not None:
+            self.pt_box.add_css_class("running")
+            state = "running"
+        elif self._pt_manual_pause:
+            self.pt_box.add_css_class("paused")
+            state = "paused"
+        else:
+            state = "waiting — not ingame"
+        self.pt_box.set_tooltip_text(
+            f"Playtime ({state})\nCounts only while a character is ingame.\n"
+            "Click: pause/resume · Right-click: reset")
+
+    def _pt_tick(self):
+        self._pt_refresh()
+        if self._pt_ingame:
+            self._pt_ticks += 1
+            if self._pt_ticks % 15 == 0 and not game_running():
+                # Game closed/crashed without a logout line.
+                self._pt_set_ingame(False)
+            elif self._pt_ticks % 30 == 0 and self._pt_since is not None:
+                self._pt_save()
+        return True
+
+    def _on_pt_click(self, gesture, n_press, x, y):
+        if gesture.get_current_button() == 3:
+            self._pt_confirm_reset()
+            return
+        self._pt_manual_pause = not self._pt_manual_pause
+        self._pt_apply()
+
+    def _pt_confirm_reset(self):
+        dialog = Gtk.Window()
+        LayerShell.init_for_window(dialog)
+        LayerShell.set_layer(dialog, LayerShell.Layer.OVERLAY)
+        LayerShell.set_keyboard_mode(dialog, LayerShell.KeyboardMode.ON_DEMAND)
+        dialog.set_default_size(280, 120)
+        dialog.add_css_class("dialog-window")
+
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        for side in ("top", "bottom", "start", "end"):
+            getattr(box, f"set_margin_{side}")(18)
+        dialog.set_child(box)
+
+        msg = Gtk.Label()
+        msg.set_markup(f'<span weight="bold">Reset playtime ({esc(self.pt_label.get_text())})?</span>')
+        box.append(msg)
+
+        btn_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        btn_row.set_halign(Gtk.Align.CENTER)
+
+        def do_reset(b):
+            self._pt_total = 0.0
+            if self._pt_since is not None:
+                self._pt_since = time.monotonic()
+            self._pt_save()
+            self._pt_refresh()
+            dialog.destroy()
+
+        yes = Gtk.Button(label="Reset")
+        yes.add_css_class("nav-btn")
+        yes.connect("clicked", do_reset)
+        btn_row.append(yes)
+
+        no = Gtk.Button(label="Cancel")
+        no.add_css_class("nav-btn")
+        no.connect("clicked", lambda b: dialog.destroy())
+        btn_row.append(no)
+
+        box.append(btn_row)
+        dialog.present()
+
     def load_progress(self):
         try:
             if not self.progress_file.exists():
@@ -3700,6 +3946,7 @@ class OverlayWindow(Gtk.ApplicationWindow):
         if self.regex_win:
             self.toggle_regex_window()
         self.save_progress()
+        self._pt_set_ingame(False)
         self._save_window_state()
         if self.observer:
             self.observer.stop()
