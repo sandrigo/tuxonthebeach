@@ -726,6 +726,41 @@ def gamescope_displays():
     return sorted(found)
 
 
+def read_clipboard_text(callback):
+    """Read the desktop clipboard and call callback(text or None) on the
+    GTK main loop. The overlay never takes keyboard focus (layer-shell
+    KeyboardMode.NONE), and Wayland only hands the selection to focused
+    clients — so Gdk's read comes back empty. wl-paste uses the
+    data-control protocol and works without focus; Gdk is the fallback."""
+    def gdk_read():
+        def done(clipboard, result):
+            try:
+                text = clipboard.read_text_finish(result)
+            except Exception as e:
+                print(f"Clipboard error: {e}")
+                text = None
+            callback(text)
+        Gdk.Display.get_default().get_clipboard().read_text_async(None, done)
+        return False
+
+    if not (shutil.which("wl-paste") and os.environ.get("WAYLAND_DISPLAY")):
+        gdk_read()
+        return
+
+    def worker():
+        try:
+            r = subprocess.run(["wl-paste", "--no-newline", "--type", "text"],
+                               capture_output=True, timeout=3)
+            if r.returncode == 0:
+                GLib.idle_add(callback, r.stdout.decode("utf-8", errors="replace"))
+                return
+            print(f"wl-paste: {r.stderr.decode(errors='ignore').strip()}")
+        except Exception as e:
+            print(f"wl-paste: {e}")
+        GLib.idle_add(gdk_read)
+    threading.Thread(target=worker, daemon=True).start()
+
+
 def copy_text_everywhere(text):
     """Put text on the desktop clipboard AND into every gamescope Xwayland.
     Returns (gamescope displays reached, list of problems)."""
@@ -2226,17 +2261,12 @@ class OverlayWindow(Gtk.ApplicationWindow):
         return False
 
     def import_from_clipboard(self):
-        clipboard = Gdk.Display.get_default().get_clipboard()
-        clipboard.read_text_async(None, self._on_clipboard_read)
+        read_clipboard_text(self._on_clipboard_read)
 
-    def _on_clipboard_read(self, clipboard, result):
-        try:
-            text = clipboard.read_text_finish(result)
-        except Exception as e:
-            print(f"Clipboard error: {e}")
-            return
-        if not text:
-            return
+    def _on_clipboard_read(self, text):
+        if not text or not text.strip():
+            self._flash("Clipboard is empty")
+            return False
         stripped = text.strip()
         if stripped[:1] in ('[', '{', '"'):
             if self.route_data.load_from_json(text):
@@ -2835,14 +2865,10 @@ class OverlayWindow(Gtk.ApplicationWindow):
         self._fit_on_screen(self.regex_win, getattr(self, 'regex_scroll', None))
 
     def _add_regex_from_clipboard(self):
-        Gdk.Display.get_default().get_clipboard().read_text_async(None, self._on_regex_clip)
+        read_clipboard_text(self._on_regex_clip)
 
-    def _on_regex_clip(self, clipboard, result):
-        try:
-            text = (clipboard.read_text_finish(result) or "").strip()
-        except Exception as e:
-            print(f"Clipboard error: {e}")
-            text = ""
+    def _on_regex_clip(self, text):
+        text = (text or "").strip()
         if not text or "\n" in text or len(text) > 1000:
             self._set_regex_status("Clipboard has no single-line regex")
             return
