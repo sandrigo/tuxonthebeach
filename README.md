@@ -24,6 +24,23 @@ cd tuxonthebeach
 python3 tuxonthebeach_gtk.py
 ```
 
+### Start without a terminal
+
+`./tuxonthebeach` starts the overlay detached (`setsid`). It keeps running after you close the terminal and logs to `~/.cache/tuxonthebeach.log`. To get a command and an app-menu entry:
+
+```bash
+ln -sf "$PWD/tuxonthebeach" ~/.local/bin/tuxonthebeach
+cat > ~/.local/share/applications/tuxonthebeach.desktop <<EOF
+[Desktop Entry]
+Type=Application
+Name=TuxontheBeach
+Exec=$HOME/.local/bin/tuxonthebeach
+Icon=$PWD/tuxonthebeach.png
+Terminal=false
+Categories=Game;Utility;
+EOF
+```
+
 Compatible compositors: **niri, sway, Hyprland, river, KDE Plasma**. GNOME/Mutter isn't supported (no layer-shell).
 
 ## Usage

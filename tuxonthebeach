@@ -1,0 +1,8 @@
+#!/bin/sh
+# Launch TuxontheBeach detached from the terminal: closing the terminal
+# (or the shell that started it) does not kill the overlay.
+# Output goes to ~/.cache/tuxonthebeach.log.
+DIR=$(dirname "$(readlink -f "$0")")
+LOG="${XDG_CACHE_HOME:-$HOME/.cache}/tuxonthebeach.log"
+mkdir -p "$(dirname "$LOG")"
+setsid -f python3 "$DIR/tuxonthebeach_gtk.py" "$@" </dev/null >>"$LOG" 2>&1
