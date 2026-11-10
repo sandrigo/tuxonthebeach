@@ -1773,12 +1773,46 @@ class OverlayWindow(Gtk.ApplicationWindow):
             LayerShell.set_margin(self, LayerShell.Edge.LEFT, new_left)
 
     def _get_output_size(self):
+        """Size of the monitor the overlay is on (not just the first one —
+        with two screens that's often the wrong one)."""
         display = self.get_display() or Gdk.Display.get_default()
+        surface = self.get_surface()
+        if display and surface:
+            mon = display.get_monitor_at_surface(surface)
+            if mon:
+                g = mon.get_geometry()
+                return g.width, g.height
         monitors = display.get_monitors() if display else None
         if monitors and monitors.get_n_items() > 0:
             g = monitors.get_item(0).get_geometry()
             return g.width, g.height
         return 1920, 1080
+
+    POPOUT_SCREEN_MARGIN = 8
+
+    def _fit_on_screen(self, win, scroll=None):
+        """Keep a popout fully on screen: cap its scroll area to the screen
+        height, and if its bottom would hang off the screen, move it up so
+        the bottom edge sits at the screen edge."""
+        if win is None:
+            return
+
+        def fit():
+            if win.get_surface() is None:
+                return False
+            _, out_h = self._get_output_size()
+            m = self.POPOUT_SCREEN_MARGIN
+            if scroll is not None:
+                # header + hint rows take ~120 px
+                scroll.set_max_content_height(max(160, out_h - 2 * m - 120))
+            h = win.get_height()
+            top = LayerShell.get_margin(win, LayerShell.Edge.TOP)
+            if h > 0 and top + h > out_h - m:
+                LayerShell.set_margin(win, LayerShell.Edge.TOP, max(m, out_h - h - m))
+            return False
+        # Twice: once the new content is measured, once after it's allocated.
+        GLib.timeout_add(40, fit)
+        GLib.timeout_add(200, fit)
 
     def _update_layer_geometry(self):
         """Recompute RIGHT/BOTTOM margins so the window stays at _fixed_* size."""
@@ -2312,6 +2346,7 @@ class OverlayWindow(Gtk.ApplicationWindow):
         root.append(self.tools_list)
 
         self.tools_win = win
+        self._tools_count = None
         self._fill_tools_list()
         GLib.timeout_add(1000, self._tools_tick)
         win.present()
@@ -2368,6 +2403,9 @@ class OverlayWindow(Gtk.ApplicationWindow):
         add.set_margin_top(4)
         add.connect("clicked", lambda b: self._add_tool())
         self.tools_list.append(add)
+        if getattr(self, '_tools_count', None) != len(tools):
+            self._tools_count = len(tools)
+            self._fit_on_screen(self.tools_win)
 
     def _toggle_tool(self, tool):
         cmd = tool.get("cmd", [])
@@ -2441,6 +2479,7 @@ class OverlayWindow(Gtk.ApplicationWindow):
         scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
         scroll.set_min_content_height(320)
         scroll.set_max_content_height(420)
+        self.pick_scroll = scroll
         self.pick_list = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
         self.pick_list.set_margin_bottom(6)
         scroll.set_child(self.pick_list)
@@ -2450,6 +2489,7 @@ class OverlayWindow(Gtk.ApplicationWindow):
         start = self.config.get("tools_last_dir") or str(Path.home())
         self._pick_show(start if os.path.isdir(start) else str(Path.home()))
         win.present()
+        self._fit_on_screen(win)
 
     def _close_picker(self):
         win, self.pick_win = getattr(self, 'pick_win', None), None
@@ -2582,6 +2622,7 @@ class OverlayWindow(Gtk.ApplicationWindow):
         scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
         scroll.set_propagate_natural_height(True)
         scroll.set_max_content_height(560)
+        self.regex_scroll = scroll
         self.regex_list = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
         self.regex_list.set_margin_bottom(6)
         scroll.set_child(self.regex_list)
@@ -2791,6 +2832,7 @@ class OverlayWindow(Gtk.ApplicationWindow):
         add.set_margin_top(4)
         add.connect("clicked", lambda b: self._add_regex_from_clipboard())
         self.regex_list.append(add)
+        self._fit_on_screen(self.regex_win, getattr(self, 'regex_scroll', None))
 
     def _add_regex_from_clipboard(self):
         Gdk.Display.get_default().get_clipboard().read_text_async(None, self._on_regex_clip)
@@ -2952,6 +2994,7 @@ class OverlayWindow(Gtk.ApplicationWindow):
         scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
         scroll.set_propagate_natural_height(True)
         scroll.set_max_content_height(560)
+        self.links_scroll = scroll
         self.links_list = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
         self.links_list.set_margin_bottom(6)
         scroll.set_child(self.links_list)
@@ -2960,6 +3003,7 @@ class OverlayWindow(Gtk.ApplicationWindow):
         self.links_win = win
         self._fill_links_list()
         win.present()
+        self._fit_on_screen(win, scroll)
 
     def _make_gem_row(self, gem):
         key = gem["name"].lower()
@@ -3149,6 +3193,7 @@ class OverlayWindow(Gtk.ApplicationWindow):
             for gem in sorted(grp["gems"], key=lambda g: g["support"]):
                 box.append(self._make_gem_row(gem))
             self.links_list.append(box)
+        self._fit_on_screen(self.links_win, getattr(self, 'links_scroll', None))
 
     def show_about(self):
         dialog = Gtk.Window()
