@@ -544,6 +544,53 @@ def parse_pob_skills(root):
     return result
 
 
+_POB_COLOR = re.compile(r'\^x[0-9A-Fa-f]{6}|\^[0-9]')
+_RX_META = re.compile(r'[\^$\[\]().*+?{}\\]')
+
+
+def _looks_like_regex(s):
+    """Heuristic for PoE search strings in free text: OR'ed short tokens
+    ("ster at|^shockwave s|a-"), or a quoted string with regex syntax."""
+    s = s.strip()
+    if len(s) < 3 or "://" in s or "www." in s:
+        return False
+    quoted = len(s) >= 2 and s[0] == '"' and s[-1] == '"'
+    inner = s.replace('"', "")
+    if "|" in inner:
+        alts = inner.split("|")
+        # Short, few-word alternatives — not a prose "a | b" table.
+        return (len(alts) >= 2 and all(a.strip() for a in alts)
+                and all(len(a) <= 40 and len(a.split()) <= 4 for a in alts))
+    if quoted and _RX_META.search(inner) and len(inner.split()) <= 4:
+        return True
+    return bool(re.search(r'\\[wdsb]|\[[a-z]+\]|\)\{\d', inner))
+
+
+def parse_pob_note_regexes(root):
+    """Pull PoE search regexes out of the PoB notes. Each hit is named after
+    its own "Label: …" prefix or the nearest text line above it."""
+    notes = root.find("Notes")
+    if notes is None or not notes.text:
+        return []
+    found, label = [], ""
+    for raw in notes.text.splitlines():
+        line = _POB_COLOR.sub("", raw).strip().strip("`").strip()
+        if not line:
+            continue
+        name, cand = label, line
+        head, sep, tail = line.partition(":")
+        if (sep and "://" not in line and len(head) <= 40
+                and not _RX_META.search(head) and _looks_like_regex(tail)):
+            name, cand = head.strip(), tail.strip()   # "Vendor: a|b|c"
+        if "://" not in line and _looks_like_regex(cand):
+            if cand not in [r["regex"] for r in found]:
+                found.append({"name": name or f"PoB regex {len(found) + 1}",
+                              "regex": cand})
+        else:
+            label = line.rstrip(":").strip()[:60]
+    return found
+
+
 def skill_set_for_level(pob, level):
     """Pick the skill set whose title ("1-17", "Lvl 12-31", "70+") covers
     the level; narrowest range wins. Falls back to PoB's active set."""
@@ -1011,8 +1058,9 @@ class LogWatcher(FileSystemEventHandler):
     TAIL_SCAN_BYTES = 32 * 1024 * 1024
 
     def __init__(self, callback, custom_path=None, level_callback=None, character=None,
-                 session_callback=None):
+                 session_callback=None, foreign_level_callback=None):
         self.callback = callback
+        self.foreign_level_callback = foreign_level_callback
         self.level_callback = level_callback
         self.session_callback = session_callback
         self.character = (character or '').strip().lower() or None
@@ -1131,6 +1179,8 @@ class LogWatcher(FileSystemEventHandler):
                         m = LEVEL_RE.search(line)
                         if m and self._is_our_char(m.group(1)):
                             self.level_callback(int(m.group(3)))
+                        elif m and self.foreign_level_callback:
+                            self.foreign_level_callback(m.group(1).strip(), int(m.group(3)))
         except Exception as e:
             print(f"Error: {e}")
 
@@ -2022,7 +2072,8 @@ class OverlayWindow(Gtk.ApplicationWindow):
         self.log_watcher = LogWatcher(self._on_zone_signal, custom,
                                       level_callback=self._on_level_signal,
                                       character=self.config.get('character_name'),
-                                      session_callback=self._on_session_signal)
+                                      session_callback=self._on_session_signal,
+                                      foreign_level_callback=self._on_foreign_level_signal)
         level, area_id, ingame = self.log_watcher.scan_tail()
         # Overlay (re)started mid-session: pick up where the log says we are.
         self._pt_set_ingame(bool(ingame) and game_running())
@@ -2050,6 +2101,28 @@ class OverlayWindow(Gtk.ApplicationWindow):
 
     def _on_level_signal(self, level):
         GLib.idle_add(self._on_level_change, level)
+
+    def _on_foreign_level_signal(self, name, level):
+        GLib.idle_add(self._on_foreign_level, name, level)
+
+    def _on_foreign_level(self, name, level):
+        """Level-up of a character that isn't the configured one: either a
+        party member, or the user is playing a different character and the
+        route/level tracking silently follows the wrong one."""
+        self._foreign_char = (name, level)
+        hinted = getattr(self, '_foreign_hinted', set())
+        self._foreign_hinted = hinted
+        if name not in hinted:
+            hinted.add(name)
+            self._foreign_hint()
+        print(f"Level-up of other character: {name} -> {level} "
+              f"(tracking '{self.config.get('character_name')}')")
+        return False
+
+    def _foreign_hint(self):
+        name, level = self._foreign_char
+        self._flash(f"⚠ {name} (Lv {level}) ≠ '{self.config.get('character_name')}' — "
+                    f"switch character in ⚙", ms=8000)
 
     def _on_session_signal(self, ingame, zone_entered):
         GLib.idle_add(lambda: self._pt_set_ingame(ingame, zone_entered) and False)
@@ -2244,6 +2317,8 @@ class OverlayWindow(Gtk.ApplicationWindow):
             print(f"Auto-progressed to step {target + 1} for zone: {zone_name}")
         else:
             self.update_display()
+            if getattr(self, '_foreign_char', None):
+                self._foreign_hint()
             if target is None:
                 print(f"Zone '{zone_name}': no forward match in route, staying at step {current + 1}")
             else:
@@ -2416,7 +2491,9 @@ class OverlayWindow(Gtk.ApplicationWindow):
 
     def _import_pob_code(self, code):
         try:
-            pob = parse_pob_skills(decode_pob_code(code))
+            root = decode_pob_code(code)
+            pob = parse_pob_skills(root)
+            pob["regexes"] = parse_pob_note_regexes(root)
         except ValueError as e:
             self._flash("Clipboard is neither a route nor a PoB code")
             print(f"PoB import: {e}")
@@ -2426,12 +2503,16 @@ class OverlayWindow(Gtk.ApplicationWindow):
             return False
         self.pob = pob
         self.save_progress()
-        n = len(pob["sets"])
-        self._flash(f"PoB imported: {n} skill set{'s' if n != 1 else ''} — click 🔗")
-        print(f"PoB imported: {[st['title'] for st in pob['sets']]}")
+        n, nrx = len(pob["sets"]), len(pob["regexes"])
+        rx_note = f", {nrx} regex from notes 🔍" if nrx else ""
+        self._flash(f"PoB imported: {n} skill set{'s' if n != 1 else ''}{rx_note} — click 🔗")
+        print(f"PoB imported: {[st['title'] for st in pob['sets']]}, "
+              f"note regexes: {[r['name'] for r in pob['regexes']]}")
         self._update_links_badge()
         if self.links_win:
             self._rebuild_links_window()
+        if self.regex_win:
+            self._fill_regex_list()
         return False
 
     def _flash(self, msg, ms=3500):
@@ -2957,6 +3038,12 @@ class OverlayWindow(Gtk.ApplicationWindow):
                 lbl.add_css_class("links-hint")
                 lbl.set_xalign(0)
                 self.regex_list.append(lbl)
+
+        # 1b) Regexes the build author put into the PoB notes.
+        if self.pob and self.pob.get("regexes"):
+            self._regex_section("From PoB notes")
+            for item in self.pob["regexes"]:
+                self._regex_row(item["name"], item["regex"])
 
         # 2) Vendor builder (poe.re patterns), all OR'ed into one search.
         self._regex_section("Vendor (poe.re)")
@@ -3670,6 +3757,8 @@ class OverlayWindow(Gtk.ApplicationWindow):
 
         if char_changed:
             self.current_level = None
+            self._foreign_char = None
+            self._foreign_hinted = set()
             self.progress_file = progress_file_for(new_char)
             self._pt_load()
             if self.progress_file.exists():
